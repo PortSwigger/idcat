@@ -14,9 +14,15 @@ concurrency:
   group: publish-image-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  IMAGE: public.ecr.aws/q3z6g1h3/idcat
+
 jobs:
-  publish:
+  version:
     runs-on: ubuntu-latest
+
+    outputs:
+      tag: ${{ steps.image-version.outputs.tag }}
 
     steps:
       - name: Check out repository
@@ -34,7 +40,28 @@ jobs:
         id: image-version
         run: |
           image_version="$(uv run bktools-image-version-hash)"
-          echo "tag=public.ecr.aws/q3z6g1h3/idcat:${image_version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${image_version}" >> "$GITHUB_OUTPUT"
+
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+            output_name: digest_amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            output_name: digest_arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    outputs:
+      digest_amd64: ${{ steps.export.outputs.digest_amd64 }}
+      digest_arm64: ${{ steps.export.outputs.digest_arm64 }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v6
@@ -47,16 +74,44 @@ jobs:
         with:
           registry-type: public
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build and push image by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true,compression=zstd,force-compression=true
+
+      - name: Export digest
+        id: export
+        run: |
+          echo "${{ matrix.output_name }}=${{ steps.build.outputs.digest }}" >> "$GITHUB_OUTPUT"
+
+  merge:
+    needs: [version, build]
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: arn:aws:iam::436027055282:role/product-roles/idcat-ecr-publish
+          aws-region: us-east-1
+
+      - name: Log in to Amazon ECR Public
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          registry-type: public
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ steps.image-version.outputs.tag }}
+      - name: Create and push manifest list
+        run: |
+          docker buildx imagetools create \
+            -t "${IMAGE}:${{ needs.version.outputs.tag }}" \
+            "${IMAGE}@${{ needs.build.outputs.digest_amd64 }}" \
+            "${IMAGE}@${{ needs.build.outputs.digest_arm64 }}"
