@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The idcat contributors
 
-use crate::config::{Config, GithubAppConfig, InstallationPolicyConfig, KeySource};
+use crate::config::{Config, GithubAppConfig, InstallationPolicyConfig, KeySource, WebhookTarget};
 use crate::error::AppError;
 use crate::github::GithubClient;
 use crate::nats::WebhookPublisher;
@@ -52,10 +52,12 @@ pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Res
         KeySource::Kms => Some(crate::kms::KmsSignerFactory::from_env().await),
     };
 
-    let webhook_publisher = match (&config.webhook_target, &config.nats) {
-        (Some(crate::config::WebhookTarget::Nats), Some(nats)) => {
-            Some(WebhookPublisher::connect(nats).await?)
-        }
+    let any_nats_webhook_target = config
+        .github_apps
+        .iter()
+        .any(|github_app| matches!(github_app.webhook_target, Some(WebhookTarget::Nats)));
+    let webhook_publisher = match (any_nats_webhook_target, &config.nats) {
+        (true, Some(nats)) => Some(WebhookPublisher::connect(nats).await?),
         _ => None,
     };
 
@@ -307,6 +309,8 @@ mod tests {
             name: "default".to_string(),
             app_id: 42,
             secret_key: "private-key.pem".to_string(),
+            webhook_target: None,
+            webhook_validation_secret_file: None,
             allowed_roles: vec!["buildkite-deploy".to_string()],
         }]);
 
@@ -323,6 +327,8 @@ mod tests {
             name: "default".to_string(),
             app_id: 42,
             secret_key: "private-key.pem".to_string(),
+            webhook_target: None,
+            webhook_validation_secret_file: None,
             allowed_roles: Vec::new(),
         }]);
 
@@ -338,6 +344,8 @@ mod tests {
             name: "default".to_string(),
             app_id: 42,
             secret_key: "private-key.pem".to_string(),
+            webhook_target: None,
+            webhook_validation_secret_file: None,
             allowed_roles: vec!["kubernetes-default".to_string()],
         }]);
         state.token_validator = TokenValidator::new(Vec::new(), false).unwrap();
@@ -361,6 +369,8 @@ mod tests {
                 name: "default".to_string(),
                 app_id: 42,
                 secret_key: "private-key.pem".to_string(),
+                webhook_target: None,
+                webhook_validation_secret_file: None,
                 allowed_roles: Vec::new(),
             }],
             vec![InstallationPolicyConfig {
@@ -393,6 +403,8 @@ mod tests {
                 name: "default".to_string(),
                 app_id: 42,
                 secret_key: "private-key.pem".to_string(),
+                webhook_target: None,
+                webhook_validation_secret_file: None,
                 allowed_roles: Vec::new(),
             }],
             vec![InstallationPolicyConfig {
@@ -420,6 +432,8 @@ mod tests {
             name: "default".to_string(),
             app_id: 42,
             secret_key: "private-key.pem".to_string(),
+            webhook_target: None,
+            webhook_validation_secret_file: None,
             allowed_roles: vec!["github-workflow".to_string()],
         }]);
         state.token_validator = TokenValidator::new(vec![github_workflow_role()], false).unwrap();
@@ -440,6 +454,8 @@ mod tests {
                 name: "default".to_string(),
                 app_id: 42,
                 secret_key: "private-key.pem".to_string(),
+                webhook_target: None,
+                webhook_validation_secret_file: None,
                 allowed_roles: Vec::new(),
             }],
             vec![workflow_self_scoping_policy()],
@@ -464,6 +480,8 @@ mod tests {
                 name: "default".to_string(),
                 app_id: 42,
                 secret_key: "private-key.pem".to_string(),
+                webhook_target: None,
+                webhook_validation_secret_file: None,
                 allowed_roles: Vec::new(),
             }],
             vec![policy],
@@ -489,6 +507,8 @@ mod tests {
                 name: "default".to_string(),
                 app_id: 42,
                 secret_key: "private-key.pem".to_string(),
+                webhook_target: None,
+                webhook_validation_secret_file: None,
                 allowed_roles: Vec::new(),
             }],
             vec![policy],
@@ -525,6 +545,8 @@ mod tests {
                 name: "default".to_string(),
                 app_id: 42,
                 secret_key: "private-key.pem".to_string(),
+                webhook_target: None,
+                webhook_validation_secret_file: None,
                 allowed_roles: Vec::new(),
             }],
             vec![workflow_self_scoping_policy()],
@@ -545,6 +567,8 @@ mod tests {
                 name: "default".to_string(),
                 app_id: 42,
                 secret_key: "private-key.pem".to_string(),
+                webhook_target: None,
+                webhook_validation_secret_file: None,
                 allowed_roles: Vec::new(),
             }],
             vec![workflow_self_scoping_policy()],
@@ -567,6 +591,8 @@ mod tests {
                 name: "default".to_string(),
                 app_id: 42,
                 secret_key: "private-key.pem".to_string(),
+                webhook_target: None,
+                webhook_validation_secret_file: None,
                 allowed_roles: Vec::new(),
             }],
             vec![workflow_self_scoping_policy()],
