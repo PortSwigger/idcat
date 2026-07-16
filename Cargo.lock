@@ -1489,6 +1489,8 @@ dependencies = [
  "axum",
  "base64",
  "clap",
+ "hex",
+ "hmac 0.12.1",
  "jsonwebtoken",
  "reqwest",
  "rsa",

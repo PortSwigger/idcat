@@ -433,6 +433,8 @@ mod tests {
             name: "default".to_string(),
             app_id: 42,
             secret_key: "private-key.pem".to_string(),
+            webhook_target: None,
+            webhook_validation_secret_file: None,
             allowed_roles: Vec::new(),
         }
     }

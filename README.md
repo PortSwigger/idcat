@@ -98,6 +98,49 @@ curl -X GET \
   http://localhost:8080/proxy/deployments/repos/github_user/repo_name/contents/README.md
 ```
 
+## Webhooks
+
+idcat can receive GitHub webhook callbacks and bridge them into NATS. GitHub
+should be configured to deliver callbacks to `/webhook/{github-app}`, where
+`{github-app}` matches a configured `[[github-app]]` name:
+
+```text
+https://idcat.example.com/webhook/deployments
+```
+
+Each GitHub App opts in to bridging independently by setting `webhook-target`
+in its config block. The NATS connection itself is configured once in a
+top-level `[nats]` block and shared by every app that opts in:
+
+```toml
+[nats]
+endpoint = "nats://nats.example.com:4222"
+subject-base = "idcat.github.webhook"
+token-path = "/var/run/secrets/idcat/nats-token"
+
+[[github-app]]
+name = "deployments"
+app-id = 123456
+secret-key = "deployments-private-key.pem"
+webhook-target = "nats"
+```
+
+If the GitHub App is configured with a webhook secret, set
+`webhook-validation-secret-file` to the path of a file containing that secret.
+idcat then verifies the `X-Hub-Signature-256` header on each delivery
+([GitHub docs](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries))
+and rejects deliveries that do not match. The secret is read from the file on
+every delivery, so it can be rotated without restarting idcat.
+
+```toml
+[[github-app]]
+name = "deployments"
+app-id = 123456
+secret-key = "deployments-private-key.pem"
+webhook-target = "nats"
+webhook-validation-secret-file = "/var/run/secrets/idcat/deployments-webhook-secret"
+```
+
 ## Running
 
 ```sh

@@ -1,8 +1,9 @@
 bind-address = "0.0.0.0:8080"
 key-source = "local"
 private-key-directory = "/var/run/secrets/idcat"
-# Optional: publish GitHub webhook callbacks to NATS.
-# webhook-target = "nats"
+# Optional: shared NATS connection used by any github-app that opts into
+# publishing its webhook callbacks (see webhook-target below). The connection
+# block is defined once here; each github-app decides whether to use it.
 #
 # [nats]
 # endpoint = "nats://nats.example.com:4222"
@@ -44,6 +45,15 @@ name = "deployments"
 app-id = 123456
 secret-key = "deployments-private-key.pem"
 allowed-roles = ["buildkite-deploy-idcat", "kubernetes-default"]
+# Optional: publish this app's webhook callbacks to the shared [nats] connection.
+# GitHub should be configured to POST deliveries to /webhook/deployments.
+# webhook-target = "nats"
+# Optional: validate incoming webhook deliveries using the shared secret
+# configured on the GitHub App. The value is a path to a file containing that
+# secret; deliveries whose X-Hub-Signature-256 header does not match are
+# rejected. See
+# https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries
+# webhook-validation-secret-file = "/var/run/secrets/idcat/deployments-webhook-secret"
 
 [[github-app]]
 name = "release-bot"
