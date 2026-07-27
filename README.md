@@ -87,6 +87,31 @@ The response body is the GitHub installation token:
 ghs_...
 ```
 
+To request one installation token scoped to several repositories owned by the
+same account, omit the repository from the URL and provide repository names in
+the JSON request body:
+
+```sh
+curl -X POST \
+  -H "Authorization: Bearer $KUBERNETES_JWT" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "repositories": ["repo_one", "repo_two"],
+    "permissions": {
+      "contents": "read",
+      "pull_requests": "write"
+    }
+  }' \
+  http://localhost:8080/installation-token/deployments/github_user
+```
+
+Every repository must be authorized by the caller's role and installation
+policies. The requested permissions must be allowed for every repository. When
+`permissions` is omitted, idcat uses the shared permission policy; if the
+repositories have different restricted policies, the request must specify an
+explicit common down-scope. The response is a JSON document containing the
+token, expiry, permissions, and GitHub repository selection metadata.
+
 To proxy a repository-scoped GitHub API request through an installation token, prefix the GitHub
 `/repos/{owner}/{repo}` path with `/proxy/{github-app}`. The GitHub app name selects the
 configured GitHub App and its allowed roles, while the owner/repo pair comes from the proxied

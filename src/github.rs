@@ -37,8 +37,8 @@ struct GithubCache {
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct InstallationTokenCacheKey {
     github_app: String,
-    repo: String,
-    scope: crate::service::TokenScope,
+    repositories: Option<Vec<String>>,
+    permissions: BTreeMap<String, String>,
 }
 
 #[derive(Clone)]
@@ -56,20 +56,23 @@ struct CreateInstallationTokenRequest {
 }
 
 fn build_create_installation_token_request(
-    scope: &crate::service::TokenScope,
-    repo: &str,
+    repositories: Option<&[String]>,
+    permissions: &BTreeMap<String, String>,
 ) -> CreateInstallationTokenRequest {
-    use crate::service::RepoScope;
-    let repositories = match scope.repositories {
-        RepoScope::All => None,
-        RepoScope::OnlyRequested => {
-            let repo_name = repo.split_once('/').map(|(_, name)| name).unwrap_or(repo);
-            Some(vec![repo_name.to_string()])
-        }
-    };
+    let repositories = repositories.map(|repositories| {
+        repositories
+            .iter()
+            .map(|repo| {
+                repo.split_once('/')
+                    .map(|(_, name)| name)
+                    .unwrap_or(repo)
+                    .to_string()
+            })
+            .collect()
+    });
     CreateInstallationTokenRequest {
         repositories,
-        permissions: (!scope.permissions.is_empty()).then(|| scope.permissions.clone()),
+        permissions: (!permissions.is_empty()).then(|| permissions.clone()),
     }
 }
 
@@ -118,15 +121,61 @@ impl GithubClient {
         repo: &str,
         scope: crate::service::TokenScope,
     ) -> anyhow::Result<InstallationTokenResponse> {
+        use crate::service::RepoScope;
+        let repositories = match scope.repositories {
+            RepoScope::All => None,
+            RepoScope::OnlyRequested => Some(vec![repo.to_string()]),
+        };
+        self.create_installation_token_for_repositories(
+            github_app,
+            signer,
+            repo,
+            repositories,
+            scope.permissions,
+        )
+        .await
+    }
+
+    pub async fn create_installation_token_for_multiple_repositories(
+        &self,
+        github_app: &GithubAppConfig,
+        signer: &dyn Signer,
+        mut repositories: Vec<String>,
+        permissions: BTreeMap<String, String>,
+    ) -> anyhow::Result<InstallationTokenResponse> {
+        repositories.sort();
+        let repo = repositories
+            .first()
+            .context("at least one repository is required")?
+            .clone();
+        self.create_installation_token_for_repositories(
+            github_app,
+            signer,
+            &repo,
+            Some(repositories),
+            permissions,
+        )
+        .await
+    }
+
+    async fn create_installation_token_for_repositories(
+        &self,
+        github_app: &GithubAppConfig,
+        signer: &dyn Signer,
+        repo: &str,
+        repositories: Option<Vec<String>>,
+        permissions: BTreeMap<String, String>,
+    ) -> anyhow::Result<InstallationTokenResponse> {
         let token_cache_key = InstallationTokenCacheKey {
             github_app: github_app.name.clone(),
-            repo: repo.to_string(),
-            scope,
+            repositories,
+            permissions,
         };
         if let Some(token) = self.cached_installation_token(&token_cache_key).await {
             debug!(
                 github_app = %github_app.name,
                 repo = %repo,
+                repositories = ?token_cache_key.repositories,
                 "using cached GitHub installation access token"
             );
             return Ok(token);
@@ -134,6 +183,7 @@ impl GithubClient {
         debug!(
             github_app = %github_app.name,
             repo = %repo,
+            repositories = ?token_cache_key.repositories,
             "cached GitHub installation access token not found or expired"
         );
         debug!(
@@ -157,7 +207,10 @@ impl GithubClient {
             installation_id,
             "resolved GitHub App installation id"
         );
-        let request = build_create_installation_token_request(&token_cache_key.scope, repo);
+        let request = build_create_installation_token_request(
+            token_cache_key.repositories.as_deref(),
+            &token_cache_key.permissions,
+        );
         debug!(
             github_app = %github_app.name,
             repo = %repo,
@@ -529,28 +582,62 @@ mod tests {
 
     #[test]
     fn build_create_installation_token_request_broad_omits_repositories() {
-        let request = build_create_installation_token_request(&broad_scope(), "myorg/alfa");
+        let request = build_create_installation_token_request(None, &BTreeMap::new());
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json, serde_json::json!({}));
     }
 
     #[test]
     fn build_create_installation_token_request_narrow_sets_repository_by_name() {
-        let request = build_create_installation_token_request(&narrow_scope(&[]), "myorg/alfa");
+        let repositories = vec!["myorg/alfa".to_string()];
+        let request =
+            build_create_installation_token_request(Some(&repositories), &BTreeMap::new());
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json, serde_json::json!({ "repositories": ["alfa"] }));
     }
 
     #[test]
     fn build_create_installation_token_request_narrow_includes_permissions() {
-        let request = build_create_installation_token_request(
-            &narrow_scope(&[("contents", "read")]),
-            "myorg/alfa",
-        );
+        let repositories = vec!["myorg/alfa".to_string(), "myorg/bravo".to_string()];
+        let permissions = BTreeMap::from([("contents".to_string(), "read".to_string())]);
+        let request = build_create_installation_token_request(Some(&repositories), &permissions);
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({ "repositories": ["alfa"], "permissions": { "contents": "read" } })
+            serde_json::json!({
+                "repositories": ["alfa", "bravo"],
+                "permissions": { "contents": "read" }
+            })
         );
+    }
+
+    #[tokio::test]
+    async fn repository_order_does_not_change_multiple_repository_cache_key() {
+        let (api_url, mint_count) = spawn_stub_github_api().await;
+        let mut client = GithubClient::new().unwrap();
+        client.api_url = api_url;
+        let github_app = test_github_app();
+        let permissions = BTreeMap::from([("contents".to_string(), "read".to_string())]);
+
+        client
+            .create_installation_token_for_multiple_repositories(
+                &github_app,
+                &StubSigner,
+                vec!["myorg/alfa".to_string(), "myorg/bravo".to_string()],
+                permissions.clone(),
+            )
+            .await
+            .unwrap();
+        client
+            .create_installation_token_for_multiple_repositories(
+                &github_app,
+                &StubSigner,
+                vec!["myorg/bravo".to_string(), "myorg/alfa".to_string()],
+                permissions,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(mint_count.load(Ordering::SeqCst), 1);
     }
 }
