@@ -25,7 +25,9 @@ use axum::response::Response;
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use clap::Parser;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use tower_http::trace::{self, TraceLayer};
 use tracing::Level;
@@ -93,6 +95,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .route(
             "/installation-token/{github_app}/{owner}/{repo}",
             post(installation_token),
+        )
+        .route(
+            "/installation-token/{github_app}/{owner}",
+            post(installation_token_for_repositories),
         )
         .route(
             "/proxy/{github_app}/repos/{owner}/{repo}",
@@ -205,6 +211,156 @@ async fn installation_token(
     let repo = format!("{owner}/{repo}");
     let token = create_installation_token_for_repo(&github_app, &repo, &state, &headers).await?;
     Ok(token.token)
+}
+
+const MAX_TOKEN_REPOSITORIES: usize = 500;
+
+#[derive(Debug, Deserialize)]
+struct MultipleRepositoriesTokenRequest {
+    repositories: Vec<String>,
+    permissions: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Debug, Serialize)]
+struct MultipleRepositoriesTokenResponse {
+    #[serde(flatten)]
+    installation_token: InstallationTokenResponse,
+    repositories: Vec<String>,
+}
+
+async fn installation_token_for_repositories(
+    Path((github_app_name, owner)): Path<(String, String)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<MultipleRepositoriesTokenRequest>,
+) -> Result<Json<MultipleRepositoriesTokenResponse>, AppError> {
+    validate_repository_names(&request.repositories)?;
+    let bearer_token = request_bearer_token(&state, &headers)?;
+    let github_app = state.github_app(&github_app_name)?;
+    let repositories: Vec<String> = request
+        .repositories
+        .iter()
+        .map(|repo| format!("{owner}/{repo}"))
+        .collect();
+    let scopes = repositories
+        .iter()
+        .map(|repo| state.authorize_github_app(github_app, repo, bearer_token.as_deref()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let permissions = select_multiple_repository_permissions(request.permissions, &scopes)?;
+    let signer = state.signer(&github_app.secret_key)?;
+    let token = state
+        .github
+        .create_installation_token_for_multiple_repositories(
+            github_app,
+            signer.as_ref(),
+            repositories,
+            permissions,
+        )
+        .await?;
+    Ok(Json(MultipleRepositoriesTokenResponse {
+        installation_token: token,
+        repositories: request
+            .repositories
+            .into_iter()
+            .map(|repo| format!("{owner}/{repo}"))
+            .collect(),
+    }))
+}
+
+fn validate_repository_names(repositories: &[String]) -> Result<(), AppError> {
+    if repositories.is_empty() {
+        return Err(AppError::BadRequest(
+            "repositories must contain at least one repository".to_string(),
+        ));
+    }
+    if repositories.len() > MAX_TOKEN_REPOSITORIES {
+        return Err(AppError::BadRequest(format!(
+            "repositories must contain no more than {MAX_TOKEN_REPOSITORIES} repositories"
+        )));
+    }
+    let mut unique = BTreeSet::new();
+    for repository in repositories {
+        if repository.is_empty() || repository.contains('/') {
+            return Err(AppError::BadRequest(format!(
+                "repository '{repository}' must be a repository name without an owner"
+            )));
+        }
+        if !unique.insert(repository) {
+            return Err(AppError::BadRequest(format!(
+                "repository '{repository}' is listed more than once"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn select_multiple_repository_permissions(
+    requested: Option<BTreeMap<String, String>>,
+    scopes: &[crate::service::TokenScope],
+) -> Result<BTreeMap<String, String>, AppError> {
+    if let Some(requested) = requested {
+        if requested.is_empty() {
+            return Err(AppError::BadRequest(
+                "permissions must not be empty when specified".to_string(),
+            ));
+        }
+        for scope in scopes {
+            ensure_permissions_allowed(&requested, &scope.permissions)?;
+        }
+        return Ok(requested);
+    }
+
+    let mut restricted = scopes
+        .iter()
+        .map(|scope| &scope.permissions)
+        .filter(|permissions| !permissions.is_empty());
+    let Some(first) = restricted.next() else {
+        return Ok(BTreeMap::new());
+    };
+    if restricted.any(|permissions| permissions != first) {
+        return Err(AppError::BadRequest(
+            "repositories have different permission policies; specify permissions explicitly"
+                .to_string(),
+        ));
+    }
+    Ok(first.clone())
+}
+
+fn ensure_permissions_allowed(
+    requested: &BTreeMap<String, String>,
+    allowed: &BTreeMap<String, String>,
+) -> Result<(), AppError> {
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    for (permission, requested_level) in requested {
+        let Some(allowed_level) = allowed.get(permission) else {
+            return Err(AppError::Unauthorized(format!(
+                "permission '{permission}' is not allowed by every matching installation policy"
+            )));
+        };
+        if !permission_level_is_at_most(requested_level, allowed_level) {
+            return Err(AppError::Unauthorized(format!(
+                "permission '{permission}' level '{requested_level}' exceeds allowed level '{allowed_level}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn permission_level_is_at_most(requested: &str, allowed: &str) -> bool {
+    fn rank(level: &str) -> Option<u8> {
+        match level {
+            "read" => Some(1),
+            "write" => Some(2),
+            "admin" => Some(3),
+            _ => None,
+        }
+    }
+    match (rank(requested), rank(allowed)) {
+        (Some(requested), Some(allowed)) => requested <= allowed,
+        _ => requested == allowed,
+    }
 }
 
 async fn proxy_repo_root(
@@ -332,22 +488,7 @@ async fn create_installation_token_for_repo(
     headers: &HeaderMap,
 ) -> Result<InstallationTokenResponse, AppError> {
     debug!(github_app = %github_app_name, repo = %repo, "installation token flow started");
-    let bearer_token = match extract_bearer_token(headers) {
-        Ok(token) => {
-            debug!(github_app = %github_app_name, repo = %repo, "authorization bearer token found");
-            Some(token)
-        }
-        Err(error) if !state.token_validator.auth_enabled() => {
-            debug!(
-                github_app = %github_app_name,
-                repo = %repo,
-                error = %error,
-                "authorization bearer token missing or invalid; continuing because auth is disabled"
-            );
-            None
-        }
-        Err(error) => return Err(error),
-    };
+    let bearer_token = request_bearer_token(state, headers)?;
     debug!(github_app = %github_app_name, repo = %repo, "selecting GitHub App config");
     let github_app = state.github_app(github_app_name)?;
     let token_scope = state.authorize_github_app(github_app, repo, bearer_token.as_deref())?;
@@ -360,6 +501,14 @@ async fn create_installation_token_for_repo(
         .await?;
     debug!(github_app = %github_app_name, repo = %repo, expires_at = %token.expires_at, "GitHub installation access token created");
     Ok(token)
+}
+
+fn request_bearer_token(state: &AppState, headers: &HeaderMap) -> Result<Option<String>, AppError> {
+    match extract_bearer_token(headers) {
+        Ok(token) => Ok(Some(token)),
+        Err(_) if !state.token_validator.auth_enabled() => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Result<String, AppError> {
@@ -393,15 +542,19 @@ fn should_return_proxy_header(name: &HeaderName) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::webhook;
+    use super::{
+        permission_level_is_at_most, select_multiple_repository_permissions,
+        validate_repository_names, webhook,
+    };
     use crate::config::{GithubAppConfig, KeySource};
     use crate::error::AppError;
     use crate::github::GithubClient;
     use crate::secret::FilePrivateKeyStore;
-    use crate::service::{AppState, TokenValidator};
+    use crate::service::{AppState, RepoScope, TokenScope, TokenValidator};
     use axum::body::Bytes;
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, StatusCode};
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     fn test_state(github_apps: Vec<GithubAppConfig>) -> AppState {
@@ -505,5 +658,83 @@ mod tests {
 
         std::fs::remove_file(&secret_file).ok();
         assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    fn token_scope(permissions: &[(&str, &str)]) -> TokenScope {
+        TokenScope {
+            repositories: RepoScope::OnlyRequested,
+            permissions: permissions
+                .iter()
+                .map(|(name, level)| (name.to_string(), level.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn validates_multiple_repository_names() {
+        validate_repository_names(&["alfa".to_string(), "bravo".to_string()]).unwrap();
+
+        assert!(validate_repository_names(&[]).is_err());
+        assert!(validate_repository_names(&["myorg/alfa".to_string()]).is_err());
+        assert!(validate_repository_names(&["alfa".to_string(), "alfa".to_string()]).is_err());
+    }
+
+    #[test]
+    fn explicit_permissions_must_be_allowed_for_every_repository() {
+        let requested = BTreeMap::from([("contents".to_string(), "write".to_string())]);
+        let scopes = vec![
+            token_scope(&[("contents", "write")]),
+            token_scope(&[("contents", "read")]),
+        ];
+
+        assert!(select_multiple_repository_permissions(Some(requested), &scopes).is_err());
+    }
+
+    #[test]
+    fn explicit_permissions_can_downscope_every_repository() {
+        let requested = BTreeMap::from([("contents".to_string(), "read".to_string())]);
+        let scopes = vec![
+            token_scope(&[("contents", "write")]),
+            token_scope(&[("contents", "read")]),
+        ];
+
+        assert_eq!(
+            select_multiple_repository_permissions(Some(requested.clone()), &scopes).unwrap(),
+            requested
+        );
+    }
+
+    #[test]
+    fn omitted_permissions_use_shared_restricted_policy() {
+        let expected = BTreeMap::from([("contents".to_string(), "read".to_string())]);
+        let scopes = vec![
+            token_scope(&[]),
+            token_scope(&[("contents", "read")]),
+            token_scope(&[("contents", "read")]),
+        ];
+
+        assert_eq!(
+            select_multiple_repository_permissions(None, &scopes).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn omitted_permissions_reject_different_restricted_policies() {
+        let scopes = vec![
+            token_scope(&[("contents", "read")]),
+            token_scope(&[("issues", "write")]),
+        ];
+
+        assert!(select_multiple_repository_permissions(None, &scopes).is_err());
+    }
+
+    #[test]
+    fn permission_levels_are_ordered() {
+        assert!(permission_level_is_at_most("read", "write"));
+        assert!(permission_level_is_at_most("write", "admin"));
+        assert!(!permission_level_is_at_most("write", "read"));
+        assert!(permission_level_is_at_most("custom", "custom"));
+        assert!(!permission_level_is_at_most("custom", "read"));
     }
 }
