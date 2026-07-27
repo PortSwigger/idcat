@@ -36,7 +36,7 @@ signature = "2.2"
 thiserror = "2.0"
 tokio = { version = "1.52", features = ["fs", "macros", "rt-multi-thread", "net", "signal", "sync"] }
 toml = "1.1"
-tower-http = { version = "0.6", features = ["trace"] }
+tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 wildmatch = "2.4"
