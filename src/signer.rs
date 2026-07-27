@@ -4,8 +4,8 @@
 use anyhow::Context;
 use rsa::{
     RsaPrivateKey, pkcs1::DecodeRsaPrivateKey, pkcs1v15::SigningKey, pkcs8::DecodePrivateKey,
+    sha2::Sha256,
 };
-use sha2::Sha256;
 use signature::{SignatureEncoding, Signer as _};
 use std::future::Future;
 use std::pin::Pin;

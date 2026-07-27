@@ -3,7 +3,7 @@
 
 use crate::error::AppError;
 use axum::http::HeaderMap;
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 const SIGNATURE_HEADER: &str = "x-hub-signature-256";
