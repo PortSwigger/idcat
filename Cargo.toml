@@ -16,22 +16,22 @@ kms = ["dep:aws-sdk-kms", "dep:aws-config"]
 
 [dependencies]
 anyhow = "1.0"
-authzoo = "0.1.1"
-async-nats = "0.49"
+authzoo = "0.1.4"
+async-nats = "0.50"
 # This feature configureation works around an upstream issue where old creates with vulnerabilites were brought in
 # https://github.com/smithy-lang/smithy-rs/issues/4651
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"], optional = true }
 aws-sdk-kms = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"], optional = true }
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 clap = { version = "4.6", features = ["derive"] }
 hex = "0.4"
-hmac = "0.12"
+hmac = "0.13"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
 rsa = { version = "0.9", features = ["sha2"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sha2 = "0.10"
+sha2 = "0.11"
 signature = "2.2"
 thiserror = "2.0"
 tokio = { version = "1.52", features = ["fs", "macros", "rt-multi-thread", "net", "signal", "sync"] }
@@ -42,7 +42,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 wildmatch = "2.4"
 
 [dev-dependencies]
-jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 
 [[example]]
 name = "kms_sign_jwt"
