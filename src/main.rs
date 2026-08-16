@@ -18,14 +18,17 @@ use crate::config::Config;
 use crate::error::AppError;
 use crate::github::InstallationTokenResponse;
 use crate::service::{AppState, build_app_state};
+use anyhow::Context;
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path, State};
 use axum::http::{HeaderMap, HeaderName, Method, StatusCode, Uri, header};
 use axum::response::Response;
 use axum::routing::{any, get, post};
 use axum::{Json, Router};
+use axum_server::tls_rustls::RustlsConfig;
 use clap::Parser;
 use serde_json::{Value, json};
+use std::future::Future;
 use std::net::SocketAddr;
 use tower_http::trace::{self, TraceLayer};
 use tracing::Level;
@@ -77,6 +80,13 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     config.validate(cli.disable_auth)?;
     let bind_address: SocketAddr = config.bind_address.parse()?;
 
+    if config.tls.is_some() {
+        // Other dependencies also use rustls and enable multiple crypto backends. Select the
+        // backend used by axum-server before constructing any clients or the TLS server config.
+        // If another dependency installed a provider first, that provider is also usable here.
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+
     info!(
         version = VERSION,
         config_path = %cli.config_path,
@@ -109,11 +119,28 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         )
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(bind_address).await?;
-    info!(address = %bind_address, "listening");
+    if let Some(tls) = &config.tls {
+        let tls_config = RustlsConfig::from_pem_file(&tls.certificate_file, &tls.private_key_file)
+            .await
+            .context("failed to load TLS certificate and private key")?;
+        info!(address = %bind_address, protocol = "https", "listening");
+        let server =
+            axum_server::bind_rustls(bind_address, tls_config).serve(app.into_make_service());
+        serve_until_termination(server).await?;
+    } else {
+        info!(address = %bind_address, protocol = "http", "listening");
+        let server = axum_server::bind(bind_address).serve(app.into_make_service());
+        serve_until_termination(server).await?;
+    }
 
+    Ok(())
+}
+
+async fn serve_until_termination(
+    server: impl Future<Output = std::io::Result<()>>,
+) -> anyhow::Result<()> {
     tokio::select! {
-        result = axum::serve(listener, app) => {
+        result = server => {
             result?;
         }
         signal = termination_signal() => {

@@ -1,4 +1,10 @@
 bind-address = "0.0.0.0:8080"
+# Optional: serve HTTPS instead of HTTP using PEM-formatted certificate and key
+# files. Change bind-address to the desired HTTPS port when enabling this block.
+#
+# [tls]
+# certificate-file = "/var/run/secrets/idcat/tls.crt"
+# private-key-file = "/var/run/secrets/idcat/tls.key"
 key-source = "local"
 private-key-directory = "/var/run/secrets/idcat"
 # Optional: shared NATS connection used by any github-app that opts into
