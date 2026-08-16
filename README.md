@@ -147,6 +147,20 @@ webhook-validation-secret-file = "/var/run/secrets/idcat/deployments-webhook-sec
 cargo run -- --config-file idcat.toml
 ```
 
+By default, idcat serves HTTP on `bind-address`. To serve HTTPS instead, configure PEM-formatted
+certificate and private key files:
+
+```toml
+bind-address = "0.0.0.0:8443"
+
+[tls]
+certificate-file = "/var/run/secrets/idcat/tls.crt"
+private-key-file = "/var/run/secrets/idcat/tls.key"
+```
+
+When `[tls]` is present, idcat serves HTTPS only. The certificate file should include any
+intermediate certificates required by clients.
+
 For local testing, authentication and role checks can be bypassed:
 
 ```sh

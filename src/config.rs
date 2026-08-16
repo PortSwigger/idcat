@@ -31,6 +31,7 @@ fn known_github_permissions() -> &'static HashSet<String> {
 pub struct Config {
     #[serde(default = "default_bind_address")]
     pub bind_address: String,
+    pub tls: Option<TlsConfig>,
     #[serde(default)]
     pub key_source: KeySource,
     #[serde(default = "default_private_key_directory")]
@@ -42,6 +43,13 @@ pub struct Config {
     pub github_apps: Vec<GithubAppConfig>,
     #[serde(rename = "installation-policy", default)]
     pub installation_policies: Vec<InstallationPolicyConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+pub struct TlsConfig {
+    pub certificate_file: String,
+    pub private_key_file: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Eq, PartialEq)]
@@ -153,6 +161,14 @@ impl Config {
     pub fn validate(&self, disable_auth: bool) -> anyhow::Result<()> {
         if self.bind_address.is_empty() {
             anyhow::bail!("bind-address must not be empty");
+        }
+        if let Some(tls) = &self.tls {
+            if tls.certificate_file.is_empty() {
+                anyhow::bail!("tls certificate-file must not be empty");
+            }
+            if tls.private_key_file.is_empty() {
+                anyhow::bail!("tls private-key-file must not be empty");
+            }
         }
         if self.key_source == KeySource::Local && self.private_key_directory.is_empty() {
             anyhow::bail!("private-key-directory must not be empty");
@@ -923,10 +939,66 @@ sub = "system:serviceaccount:idelephant:default"
 
         config.validate(false).unwrap();
         assert_eq!(config.bind_address, "0.0.0.0:8080");
+        assert_eq!(config.tls, None);
         assert_eq!(config.key_source, KeySource::Local);
         assert_eq!(config.private_key_directory, "/var/run/secrets/idcat");
         assert_eq!(config.github_apps[0].webhook_target, None);
         assert_eq!(config.nats, None);
+    }
+
+    #[test]
+    fn parses_tls_config() {
+        let config: Config = toml::from_str(
+            r#"
+[tls]
+certificate-file = "/var/run/secrets/idcat/tls.crt"
+private-key-file = "/var/run/secrets/idcat/tls.key"
+
+[[github-app]]
+name = "default"
+app-id = 42
+secret-key = "private-key.pem"
+"#,
+        )
+        .unwrap();
+
+        config.validate(true).unwrap();
+        let tls = config.tls.unwrap();
+        assert_eq!(tls.certificate_file, "/var/run/secrets/idcat/tls.crt");
+        assert_eq!(tls.private_key_file, "/var/run/secrets/idcat/tls.key");
+    }
+
+    #[test]
+    fn rejects_empty_tls_file_paths() {
+        for (certificate_file, private_key_file, expected_error) in [
+            (
+                "",
+                "/var/run/secrets/idcat/tls.key",
+                "tls certificate-file must not be empty",
+            ),
+            (
+                "/var/run/secrets/idcat/tls.crt",
+                "",
+                "tls private-key-file must not be empty",
+            ),
+        ] {
+            let config: Config = toml::from_str(&format!(
+                r#"
+[tls]
+certificate-file = "{certificate_file}"
+private-key-file = "{private_key_file}"
+
+[[github-app]]
+name = "default"
+app-id = 42
+secret-key = "private-key.pem"
+"#,
+            ))
+            .unwrap();
+
+            let error = config.validate(true).unwrap_err().to_string();
+            assert_eq!(error, expected_error);
+        }
     }
 
     #[test]
