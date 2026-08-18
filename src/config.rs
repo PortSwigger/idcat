@@ -100,7 +100,6 @@ struct RawInstallationPolicyConfig {
     #[serde(default)]
     allow_self_access: bool,
     // Keys are GitHub permission names (snake_case), not kebab-case.
-    #[serde(default)]
     permissions: BTreeMap<String, String>,
 }
 
@@ -331,6 +330,14 @@ impl Config {
                         );
                     }
                 }
+                if installation_policy.permissions.is_empty() {
+                    anyhow::bail!(
+                        "installation-policy for github-app '{}' repository '{}' role '{}' must define at least one permission",
+                        installation_policy.github_app,
+                        installation_policy.repositories_label(),
+                        installation_policy.role
+                    );
+                }
                 for (name, value) in &installation_policy.permissions {
                     if !known_github_permissions().contains(name.as_str()) {
                         warn!(
@@ -418,6 +425,7 @@ secret-key = "private-key.pem"
 github-app = "deployments"
 repository = "myorg/*"
 role = "github-workflow"
+permissions = { contents = "read" }
 
 [installation-policy.required-claims]
 environment = "production"
@@ -449,6 +457,7 @@ github-app = "deployments"
 repository = "myorg/*"
 role = "github-workflow"
 allow-self-access = true
+permissions = { contents = "read" }
 "#,
         )
         .unwrap();
@@ -477,6 +486,7 @@ github-app = "deployments"
 repository = "*"
 role = "github-workflow"
 allow-self-access = true
+permissions = { contents = "read" }
 "#,
         )
         .unwrap();
@@ -505,6 +515,7 @@ github-app = "deployments"
 repository = "myorg/alfa"
 role = "github-workflow"
 allow-self-access = true
+permissions = { contents = "read" }
 "#,
         )
         .unwrap();
@@ -535,6 +546,7 @@ secret-key = "private-key.pem"
 github-app = "deployments"
 repositories = ["myorg/alfa", "myorg/bravo"]
 role = "github-workflow"
+permissions = { contents = "read" }
 
 [installation-policy.required-claims]
 repository = "myorg/gamma"
@@ -570,6 +582,7 @@ github-app = "deployments"
 repository = "myorg/alfa"
 repositories = ["myorg/bravo"]
 role = "github-workflow"
+permissions = { contents = "read" }
 
 [installation-policy.required-claims]
 repository = "myorg/gamma"
@@ -603,6 +616,7 @@ secret-key = "private-key.pem"
 [[installation-policy]]
 github-app = "deployments"
 role = "github-workflow"
+permissions = { contents = "read" }
 
 [installation-policy.required-claims]
 repository = "myorg/gamma"
@@ -637,6 +651,7 @@ secret-key = "private-key.pem"
 github-app = "deployments"
 repositories = []
 role = "github-workflow"
+permissions = { contents = "read" }
 
 [installation-policy.required-claims]
 repository = "myorg/gamma"
@@ -672,6 +687,7 @@ github-app = "deployments"
 repository = "myorg/*"
 role = "github-workflow"
 allow-self-access = true
+permissions = { contents = "read" }
 
 [installation-policy.required-claims]
 repository = "myorg/alfa"
@@ -706,6 +722,7 @@ secret-key = "private-key.pem"
 github-app = "deployments"
 repository = "myorg/alfa"
 role = "github-workflow"
+permissions = { contents = "read" }
 
 [installation-policy.required-claims]
 repository = ["myorg/alfa", "myorg/bravo"]
@@ -747,6 +764,7 @@ secret-key = "private-key.pem"
 github-app = "deployments"
 repository = "owner-only-no-slash"
 role = "github-workflow"
+permissions = { contents = "read" }
 
 [installation-policy.required-claims]
 repository = "myorg/gamma"
@@ -860,8 +878,8 @@ pull_requests = "write"
     }
 
     #[test]
-    fn installation_policy_permissions_default_empty_when_absent() {
-        let config: Config = toml::from_str(
+    fn rejects_installation_policy_without_permissions() {
+        let error = toml::from_str::<Config>(
             r#"
 [[role]]
 name = "github-workflow"
@@ -884,10 +902,50 @@ role = "github-workflow"
 repository = "myorg/gamma"
 "#,
         )
+        .expect_err("installation-policy without permissions must be rejected");
+
+        assert!(
+            error.to_string().contains("missing field `permissions`"),
+            "expected missing permissions error, got: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_installation_policy_with_empty_permissions() {
+        let config: Config = toml::from_str(
+            r#"
+[[role]]
+name = "github-workflow"
+audience = "idcat"
+issuer = "https://token.actions.githubusercontent.com"
+validation-key = "shared-secret"
+algorithms = ["HS256"]
+
+[[github-app]]
+name = "deployments"
+app-id = 42
+secret-key = "private-key.pem"
+
+[[installation-policy]]
+github-app = "deployments"
+repository = "myorg/alfa"
+role = "github-workflow"
+permissions = {}
+
+[installation-policy.required-claims]
+repository = "myorg/gamma"
+"#,
+        )
         .unwrap();
 
-        let policy = &config.installation_policies[0];
-        assert!(policy.permissions.is_empty());
+        let error = config
+            .validate(false)
+            .expect_err("empty permissions table must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "installation-policy for github-app 'deployments' repository 'myorg/alfa' role 'github-workflow' must define at least one permission"
+        );
     }
 
     #[test]
@@ -1144,6 +1202,7 @@ secret-key = "private-key.pem"
 github-app = "deployments"
 repository = "myorg/alfa"
 role = "github-workflow"
+permissions = { contents = "read" }
 
 [installation-policy.required-claims]
 repository = "myorg/gamma"
@@ -1221,6 +1280,7 @@ secret-key = "private-key.pem"
 github-app = "deployments"
 repository = "myorg/alfa"
 role = "github-workflow"
+permissions = { contents = "read" }
 "#,
         )
         .unwrap();

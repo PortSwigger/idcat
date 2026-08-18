@@ -45,6 +45,7 @@ github-app = "deployments"
 repositories = ["myorg/alfa", "myorg/beta"]
 role = "github-workflow"
 required-claims = { repository = "myorg/gamma" }
+permissions = { contents = "read" }
 ```
 
 See `idcat.toml.example` for a fuller configuration with multiple roles and GitHub Apps.
@@ -55,8 +56,10 @@ combination, with additional required token claims. Set either `repository = "ow
 or `repositories = ["owner/name", "owner/other"]`; the request may match any configured
 repository pattern. For example, a request for `deployments` on `myorg/alfa` can require
 the token to satisfy `github-workflow` and also
-carry `repository = "myorg/gamma"`. App-level `allowed-roles` still grant access to every
-repository installation for that GitHub App.
+carry `repository = "myorg/gamma"`. Every `[[installation-policy]]` must also declare a
+non-empty `permissions` table naming the GitHub permissions the minted token gets, so a
+policy can never hand out the App's full installation permissions. App-level
+`allowed-roles` still grant access to every repository installation for that GitHub App.
 
 Mount the private keys as files. For example, in Kubernetes this could be a Secret volume mounted at `private-key-directory`, but `idcat` only reads files from the filesystem.
 

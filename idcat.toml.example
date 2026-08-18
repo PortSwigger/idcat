@@ -69,6 +69,9 @@ role = "github-workflow"
 [installation-policy.required-claims]
 repository = "myorg/gamma"
 
+[installation-policy.permissions]
+contents = "read"
+
 [[installation-policy]]
 github-app = "deployments"
 repositories = ["myorg/beta", "myorg/delta"]
@@ -76,6 +79,9 @@ role = "github-workflow"
 
 [installation-policy.required-claims]
 repository = "myorg/epsilon"
+
+[installation-policy.permissions]
+contents = "write"
 
 # `repository` and each `repositories` entry accepts a glob where `*` matches
 # any characters (including `/`); so `"myorg/*"` matches any repo under
@@ -95,8 +101,12 @@ repository = "myorg/*"
 role = "github-workflow"
 allow-self-access = true
 
-# A `[installation-policy.permissions]` table down-scopes what the minted
-# token can DO. Absent/empty means the App's full installation permissions.
+[installation-policy.permissions]
+contents = "read"
+
+# The `[installation-policy.permissions]` table is required and must name at
+# least one permission — it down-scopes what the minted token can DO, so
+# there is no way to ask for the App's full installation permissions.
 # Keys are GitHub permission names in snake_case (forwarded to GitHub verbatim
 # — deliberately NOT kebab-case like the rest of this config); values are
 # read/write/admin. Unrecognised names or values only emit a startup warning
