@@ -14,10 +14,10 @@ mod service;
 mod signer;
 mod webhook;
 
-use crate::config::Config;
+use crate::config::{Config, GithubAppConfig};
 use crate::error::AppError;
-use crate::github::InstallationTokenResponse;
-use crate::service::{AppState, build_app_state};
+use crate::github::{InstallationTarget, InstallationTokenResponse};
+use crate::service::{AppState, TokenScope, build_app_state};
 use anyhow::Context;
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path, State};
@@ -100,6 +100,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/webhook/{github_app}", post(webhook))
+        .route(
+            "/installation-token/{github_app}/{owner}",
+            post(owner_installation_token),
+        )
         .route(
             "/installation-token/{github_app}/{owner}/{repo}",
             post(installation_token),
@@ -234,6 +238,18 @@ async fn installation_token(
     Ok(token.token)
 }
 
+/// Mints an installation-wide token for `owner`. This path names no repository, so the token it
+/// returns is deliberately not repository-scoped; only `[[owner-policy]]` entries (or app-level
+/// `allowed-roles`) can authorize it.
+async fn owner_installation_token(
+    Path((github_app, owner)): Path<(String, String)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<String, AppError> {
+    let token = create_installation_token_for_owner(&github_app, &owner, &state, &headers).await?;
+    Ok(token.token)
+}
+
 async fn proxy_repo_root(
     Path((github_app, owner, repo)): Path<(String, String, String)>,
     State(state): State<AppState>,
@@ -358,16 +374,51 @@ async fn create_installation_token_for_repo(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<InstallationTokenResponse, AppError> {
-    debug!(github_app = %github_app_name, repo = %repo, "installation token flow started");
+    let target = InstallationTarget::Repository(repo.to_string());
+    create_installation_token(
+        github_app_name,
+        &target,
+        state,
+        headers,
+        |github_app, bearer| state.authorize_github_app(github_app, repo, bearer),
+    )
+    .await
+}
+
+async fn create_installation_token_for_owner(
+    github_app_name: &str,
+    owner: &str,
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<InstallationTokenResponse, AppError> {
+    let target = InstallationTarget::Owner(owner.to_string());
+    create_installation_token(
+        github_app_name,
+        &target,
+        state,
+        headers,
+        |github_app, bearer| state.authorize_owner(github_app, owner, bearer),
+    )
+    .await
+}
+
+async fn create_installation_token(
+    github_app_name: &str,
+    target: &InstallationTarget,
+    state: &AppState,
+    headers: &HeaderMap,
+    authorize: impl FnOnce(&GithubAppConfig, Option<&str>) -> Result<TokenScope, AppError>,
+) -> Result<InstallationTokenResponse, AppError> {
+    debug!(github_app = %github_app_name, target = %target, "installation token flow started");
     let bearer_token = match extract_bearer_token(headers) {
         Ok(token) => {
-            debug!(github_app = %github_app_name, repo = %repo, "authorization bearer token found");
+            debug!(github_app = %github_app_name, target = %target, "authorization bearer token found");
             Some(token)
         }
         Err(error) if !state.token_validator.auth_enabled() => {
             debug!(
                 github_app = %github_app_name,
-                repo = %repo,
+                target = %target,
                 error = %error,
                 "authorization bearer token missing or invalid; continuing because auth is disabled"
             );
@@ -375,17 +426,17 @@ async fn create_installation_token_for_repo(
         }
         Err(error) => return Err(error),
     };
-    debug!(github_app = %github_app_name, repo = %repo, "selecting GitHub App config");
+    debug!(github_app = %github_app_name, target = %target, "selecting GitHub App config");
     let github_app = state.github_app(github_app_name)?;
-    let token_scope = state.authorize_github_app(github_app, repo, bearer_token.as_deref())?;
-    debug!(github_app = %github_app_name, repo = %repo, secret_key = %github_app.secret_key, key_source = ?state.key_source, ?token_scope, "preparing GitHub App signer");
+    let token_scope = authorize(github_app, bearer_token.as_deref())?;
+    debug!(github_app = %github_app_name, target = %target, secret_key = %github_app.secret_key, key_source = ?state.key_source, ?token_scope, "preparing GitHub App signer");
     let signer = state.signer(&github_app.secret_key)?;
-    debug!(github_app = %github_app_name, repo = %repo, ?token_scope, "requesting GitHub installation access token");
+    debug!(github_app = %github_app_name, target = %target, ?token_scope, "requesting GitHub installation access token");
     let token = state
         .github
-        .create_installation_token(github_app, signer.as_ref(), repo, token_scope)
+        .create_installation_token(github_app, signer.as_ref(), target, token_scope)
         .await?;
-    debug!(github_app = %github_app_name, repo = %repo, expires_at = %token.expires_at, "GitHub installation access token created");
+    debug!(github_app = %github_app_name, target = %target, expires_at = %token.expires_at, "GitHub installation access token created");
     Ok(token)
 }
 
@@ -435,6 +486,7 @@ mod tests {
         AppState {
             github_apps: Arc::new(github_apps),
             installation_policies: Arc::new(Vec::new()),
+            owner_policies: Arc::new(Vec::new()),
             token_validator: TokenValidator::new(Vec::new(), true).unwrap(),
             github: GithubClient::new().unwrap(),
             webhook_publisher: None,

@@ -8,7 +8,7 @@ use anyhow::Context;
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CONTENT_LENGTH, HOST, HeaderMap, HeaderName, HeaderValue, USER_AGENT,
 };
-use reqwest::{Client, Method, Response};
+use reqwest::{Client, Method, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -34,10 +34,41 @@ struct GithubCache {
     installation_tokens: BTreeMap<InstallationTokenCacheKey, CachedInstallationToken>,
 }
 
+/// What a token request is aimed at. A repository resolves the installation through the repository
+/// and can be scoped down to it; an owner resolves the installation through the account itself and
+/// has no repository to scope to, so it always yields an installation-wide token.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum InstallationTarget {
+    /// A repository in `owner/name` form.
+    Repository(String),
+    /// An account (organization or user) that has the GitHub App installed.
+    Owner(String),
+}
+
+impl InstallationTarget {
+    /// A cache key that cannot collide across variants, so an owner named `alfa` never shares an
+    /// entry with a repository whose path happens to render the same way.
+    fn cache_key(&self) -> String {
+        match self {
+            Self::Repository(repo) => format!("repo:{repo}"),
+            Self::Owner(owner) => format!("owner:{owner}"),
+        }
+    }
+}
+
+impl std::fmt::Display for InstallationTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Repository(repo) => write!(formatter, "repository '{repo}'"),
+            Self::Owner(owner) => write!(formatter, "owner '{owner}'"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct InstallationTokenCacheKey {
     github_app: String,
-    repo: String,
+    target: InstallationTarget,
     scope: crate::service::TokenScope,
 }
 
@@ -57,20 +88,27 @@ struct CreateInstallationTokenRequest {
 
 fn build_create_installation_token_request(
     scope: &crate::service::TokenScope,
-    repo: &str,
-) -> CreateInstallationTokenRequest {
+    target: &InstallationTarget,
+) -> anyhow::Result<CreateInstallationTokenRequest> {
     use crate::service::RepoScope;
-    let repositories = match scope.repositories {
-        RepoScope::All => None,
-        RepoScope::OnlyRequested => {
+    let repositories = match (scope.repositories, target) {
+        (RepoScope::All, _) => None,
+        (RepoScope::OnlyRequested, InstallationTarget::Repository(repo)) => {
             let repo_name = repo.split_once('/').map(|(_, name)| name).unwrap_or(repo);
             Some(vec![repo_name.to_string()])
         }
+        // An owner request names no repository to scope to. Falling back to an installation-wide
+        // token here would hand out a broader token than the caller was authorized for, so refuse.
+        (RepoScope::OnlyRequested, InstallationTarget::Owner(owner)) => {
+            anyhow::bail!(
+                "cannot mint a repository-scoped token for owner '{owner}': no repository was requested"
+            );
+        }
     };
-    CreateInstallationTokenRequest {
+    Ok(CreateInstallationTokenRequest {
         repositories,
         permissions: (!scope.permissions.is_empty()).then(|| scope.permissions.clone()),
-    }
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -115,52 +153,52 @@ impl GithubClient {
         &self,
         github_app: &GithubAppConfig,
         signer: &dyn Signer,
-        repo: &str,
+        target: &InstallationTarget,
         scope: crate::service::TokenScope,
     ) -> anyhow::Result<InstallationTokenResponse> {
         let token_cache_key = InstallationTokenCacheKey {
             github_app: github_app.name.clone(),
-            repo: repo.to_string(),
+            target: target.clone(),
             scope,
         };
         if let Some(token) = self.cached_installation_token(&token_cache_key).await {
             debug!(
                 github_app = %github_app.name,
-                repo = %repo,
+                target = %target,
                 "using cached GitHub installation access token"
             );
             return Ok(token);
         }
         debug!(
             github_app = %github_app.name,
-            repo = %repo,
+            target = %target,
             "cached GitHub installation access token not found or expired"
         );
         debug!(
             github_app = %github_app.name,
-            repo = %repo,
+            target = %target,
             app_id = github_app.app_id,
             "building GitHub App JWT"
         );
         let jwt = build_github_app_jwt(github_app.app_id, signer).await?;
         debug!(
             github_app = %github_app.name,
-            repo = %repo,
+            target = %target,
             "resolving GitHub App installation id"
         );
         let installation_id = self
-            .cached_repository_installation_id(&jwt, &github_app.name, repo)
+            .cached_installation_id(&jwt, &github_app.name, target)
             .await?;
         debug!(
             github_app = %github_app.name,
-            repo = %repo,
+            target = %target,
             installation_id,
             "resolved GitHub App installation id"
         );
-        let request = build_create_installation_token_request(&token_cache_key.scope, repo);
+        let request = build_create_installation_token_request(&token_cache_key.scope, target)?;
         debug!(
             github_app = %github_app.name,
-            repo = %repo,
+            target = %target,
             installation_id,
             "sending GitHub installation access token request"
         );
@@ -176,8 +214,8 @@ impl GithubClient {
             .await
             .with_context(|| {
                 format!(
-                    "failed to request installation access token for '{}' with github_app '{}'",
-                    repo, github_app.name
+                    "failed to request installation access token for {} with github_app '{}'",
+                    target, github_app.name
                 )
             })?;
 
@@ -185,21 +223,21 @@ impl GithubClient {
             .error_for_status()
             .with_context(|| {
                 format!(
-                    "GitHub installation access token request for '{}' with github_app '{}' returned an error status",
-                    repo, github_app.name
+                    "GitHub installation access token request for {} with github_app '{}' returned an error status",
+                    target, github_app.name
                 )
             })?
             .json()
             .await
             .with_context(|| {
                 format!(
-                    "failed to parse GitHub installation access token response for '{}' with github_app '{}'",
-                    repo, github_app.name
+                    "failed to parse GitHub installation access token response for {} with github_app '{}'",
+                    target, github_app.name
                 )
             })?;
         debug!(
             github_app = %github_app.name,
-            repo = %repo,
+            target = %target,
             installation_id,
             expires_at = %token.expires_at,
             repository_selection = ?token.repository_selection,
@@ -230,6 +268,15 @@ impl GithubClient {
             .context("failed to forward proxied GitHub API request")
     }
 
+    async fn installation_id(&self, jwt: &str, target: &InstallationTarget) -> anyhow::Result<u64> {
+        match target {
+            InstallationTarget::Repository(repo) => {
+                self.repository_installation_id(jwt, repo).await
+            }
+            InstallationTarget::Owner(owner) => self.owner_installation_id(jwt, owner).await,
+        }
+    }
+
     async fn repository_installation_id(&self, jwt: &str, repo: &str) -> anyhow::Result<u64> {
         let (owner, repo_name) = repo
             .split_once('/')
@@ -258,13 +305,75 @@ impl GithubClient {
         Ok(installation.id)
     }
 
-    async fn cached_repository_installation_id(
+    /// Resolves the installation for an account. `owner` may name either an organization or a user,
+    /// and GitHub serves those from different endpoints, so try the organization first and fall back
+    /// to the user endpoint when the account is not an organization.
+    async fn owner_installation_id(&self, jwt: &str, owner: &str) -> anyhow::Result<u64> {
+        debug!(owner = %owner, "looking up organization installation");
+        match self
+            .installation_id_from_path(jwt, &format!("orgs/{owner}/installation"))
+            .await?
+        {
+            Some(installation_id) => {
+                debug!(owner = %owner, installation_id, "organization installation lookup parsed");
+                Ok(installation_id)
+            }
+            None => {
+                debug!(
+                    owner = %owner,
+                    "no organization installation found; looking up user installation"
+                );
+                let installation_id = self
+                    .installation_id_from_path(jwt, &format!("users/{owner}/installation"))
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "no GitHub App installation found for owner '{owner}' as an organization or a user"
+                        )
+                    })?;
+                debug!(owner = %owner, installation_id, "user installation lookup parsed");
+                Ok(installation_id)
+            }
+        }
+    }
+
+    /// Fetches an installation id from an installation lookup path, mapping `404 Not Found` to
+    /// `None` so the caller can try another path rather than failing the request.
+    async fn installation_id_from_path(
+        &self,
+        jwt: &str,
+        path: &str,
+    ) -> anyhow::Result<Option<u64>> {
+        let response = self
+            .client
+            .get(format!("{}/{}", self.api_url, path))
+            .header(AUTHORIZATION, format!("Bearer {jwt}"))
+            .send()
+            .await
+            .with_context(|| format!("failed to resolve GitHub App installation via '{path}'"))?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let installation: RepositoryInstallationResponse = response
+            .error_for_status()
+            .with_context(|| {
+                format!("GitHub App installation lookup '{path}' returned an error status")
+            })?
+            .json()
+            .await
+            .with_context(|| {
+                format!("failed to parse GitHub App installation lookup response for '{path}'")
+            })?;
+        Ok(Some(installation.id))
+    }
+
+    async fn cached_installation_id(
         &self,
         jwt: &str,
         github_app_name: &str,
-        repo: &str,
+        target: &InstallationTarget,
     ) -> anyhow::Result<u64> {
-        let cache_key = format!("{github_app_name}/{repo}");
+        let cache_key = format!("{github_app_name}/{}", target.cache_key());
         if let Some(installation_id) = self
             .cache
             .lock()
@@ -275,7 +384,7 @@ impl GithubClient {
         {
             debug!(
                 github_app = %github_app_name,
-                repo = %repo,
+                target = %target,
                 installation_id,
                 "using cached GitHub App installation id"
             );
@@ -283,10 +392,10 @@ impl GithubClient {
         }
         debug!(
             github_app = %github_app_name,
-            repo = %repo,
+            target = %target,
             "cached GitHub App installation id not found"
         );
-        let installation_id = self.repository_installation_id(jwt, repo).await?;
+        let installation_id = self.installation_id(jwt, target).await?;
         self.cache
             .lock()
             .await
@@ -294,7 +403,7 @@ impl GithubClient {
             .insert(cache_key, installation_id);
         debug!(
             github_app = %github_app_name,
-            repo = %repo,
+            target = %target,
             installation_id,
             "cached GitHub App installation id"
         );
@@ -372,7 +481,7 @@ fn should_forward_header(name: &HeaderName) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{GithubClient, build_create_installation_token_request};
+    use super::{GithubClient, InstallationTarget, build_create_installation_token_request};
     use crate::config::GithubAppConfig;
     use crate::service::{RepoScope, TokenScope};
     use crate::signer::Signer;
@@ -380,6 +489,7 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct StubSigner;
@@ -393,39 +503,101 @@ mod tests {
         }
     }
 
-    /// Stub GitHub API that resolves a fixed installation id and mints a
-    /// uniquely-numbered token on each POST, returning the running mint count
-    /// so a cache hit (which skips the POST) is observable from the test.
-    async fn spawn_stub_github_api() -> (String, Arc<AtomicUsize>) {
+    /// One recorded call to the stub's access-token endpoint.
+    struct StubTokenRequest {
+        installation_id: u64,
+        body: serde_json::Value,
+    }
+
+    /// Stub GitHub API that resolves installation ids and mints a uniquely-numbered token on each
+    /// POST. `mint_count` makes a cache hit (which skips the POST) observable, and `token_requests`
+    /// records what idcat actually asked GitHub for.
+    struct StubGithubApi {
+        url: String,
+        mint_count: Arc<AtomicUsize>,
+        token_requests: Arc<StdMutex<Vec<StubTokenRequest>>>,
+    }
+
+    const STUB_REPOSITORY_INSTALLATION_ID: u64 = 123;
+    const STUB_ORGANIZATION_INSTALLATION_ID: u64 = 456;
+    const STUB_USER_INSTALLATION_ID: u64 = 789;
+
+    /// Spawns a [`StubGithubApi`]. `organizations` names the accounts served by
+    /// `/orgs/{org}/installation`; any other account gets a 404 there and is served by
+    /// `/users/{username}/installation`, mirroring how GitHub splits organization and user
+    /// installations.
+    async fn spawn_stub_github_api(organizations: &[&str]) -> StubGithubApi {
         use axum::Json;
+        use axum::extract::Path;
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
         use axum::routing::{get, post};
 
+        let organizations: Arc<Vec<String>> =
+            Arc::new(organizations.iter().map(|org| org.to_string()).collect());
         let mint_count = Arc::new(AtomicUsize::new(0));
+        let token_requests = Arc::new(StdMutex::new(Vec::new()));
         let mint_count_for_handler = mint_count.clone();
+        let token_requests_for_handler = token_requests.clone();
         let app = axum::Router::new()
             .route(
                 "/repos/{owner}/{repo}/installation",
-                get(|| async { Json(serde_json::json!({ "id": 123 })) }),
+                get(|| async {
+                    Json(serde_json::json!({ "id": STUB_REPOSITORY_INSTALLATION_ID }))
+                }),
+            )
+            .route(
+                "/orgs/{org}/installation",
+                get(move |Path(org): Path<String>| {
+                    let organizations = organizations.clone();
+                    async move {
+                        if organizations.contains(&org) {
+                            Json(serde_json::json!({ "id": STUB_ORGANIZATION_INSTALLATION_ID }))
+                                .into_response()
+                        } else {
+                            (
+                                StatusCode::NOT_FOUND,
+                                Json(serde_json::json!({ "message": "Not Found" })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/users/{username}/installation",
+                get(|| async { Json(serde_json::json!({ "id": STUB_USER_INSTALLATION_ID })) }),
             )
             .route(
                 "/app/installations/{id}/access_tokens",
-                post(move || {
-                    let mint_count = mint_count_for_handler.clone();
-                    async move {
-                        let n = mint_count.fetch_add(1, Ordering::SeqCst) + 1;
-                        Json(serde_json::json!({
-                            "token": format!("ghs_token_{n}"),
-                            "expires_at": "2099-01-01T00:00:00Z",
-                        }))
-                    }
-                }),
+                post(
+                    move |Path(installation_id): Path<u64>, Json(body): Json<serde_json::Value>| {
+                        let mint_count = mint_count_for_handler.clone();
+                        let token_requests = token_requests_for_handler.clone();
+                        async move {
+                            let n = mint_count.fetch_add(1, Ordering::SeqCst) + 1;
+                            token_requests.lock().unwrap().push(StubTokenRequest {
+                                installation_id,
+                                body,
+                            });
+                            Json(serde_json::json!({
+                                "token": format!("ghs_token_{n}"),
+                                "expires_at": "2099-01-01T00:00:00Z",
+                            }))
+                        }
+                    },
+                ),
             );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        (format!("http://{addr}"), mint_count)
+        StubGithubApi {
+            url: format!("http://{addr}"),
+            mint_count,
+            token_requests,
+        }
     }
 
     fn test_github_app() -> GithubAppConfig {
@@ -456,23 +628,41 @@ mod tests {
         }
     }
 
+    fn repository_target() -> InstallationTarget {
+        InstallationTarget::Repository("myorg/alfa".to_string())
+    }
+
+    fn owner_target() -> InstallationTarget {
+        InstallationTarget::Owner("myorg".to_string())
+    }
+
     #[tokio::test]
     async fn narrow_caller_is_not_served_a_cached_broad_token() {
-        let (api_url, mint_count) = spawn_stub_github_api().await;
+        let stub = spawn_stub_github_api(&["myorg"]).await;
         let mut client = GithubClient::new().unwrap();
-        client.api_url = api_url;
+        client.api_url = stub.url;
         let github_app = test_github_app();
 
         // A broad-scoped caller mints and caches a token for the repo first.
         let broad = client
-            .create_installation_token(&github_app, &StubSigner, "myorg/alfa", broad_scope())
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                &repository_target(),
+                broad_scope(),
+            )
             .await
             .unwrap();
         // A caller authorized only for the requested repo then asks for the same
         // repo. It must get its own freshly-minted, repo-scoped token — not the
         // cached broad token covering the whole installation.
         let narrow = client
-            .create_installation_token(&github_app, &StubSigner, "myorg/alfa", narrow_scope(&[]))
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                &repository_target(),
+                narrow_scope(&[]),
+            )
             .await
             .unwrap();
 
@@ -481,7 +671,7 @@ mod tests {
             "narrow caller received the cached broad-scoped token"
         );
         assert_eq!(
-            mint_count.load(Ordering::SeqCst),
+            stub.mint_count.load(Ordering::SeqCst),
             2,
             "each scope must mint its own token rather than share a cache entry"
         );
@@ -489,9 +679,9 @@ mod tests {
 
     #[tokio::test]
     async fn caller_is_not_served_a_cached_token_with_different_permissions() {
-        let (api_url, mint_count) = spawn_stub_github_api().await;
+        let stub = spawn_stub_github_api(&["myorg"]).await;
         let mut client = GithubClient::new().unwrap();
-        client.api_url = api_url;
+        client.api_url = stub.url;
         let github_app = test_github_app();
 
         // A read-only caller mints and caches a token for the repo.
@@ -499,7 +689,7 @@ mod tests {
             .create_installation_token(
                 &github_app,
                 &StubSigner,
-                "myorg/alfa",
+                &repository_target(),
                 narrow_scope(&[("contents", "read")]),
             )
             .await
@@ -510,7 +700,7 @@ mod tests {
             .create_installation_token(
                 &github_app,
                 &StubSigner,
-                "myorg/alfa",
+                &repository_target(),
                 narrow_scope(&[("contents", "write")]),
             )
             .await
@@ -521,22 +711,113 @@ mod tests {
             "write caller received the cached read-only token"
         );
         assert_eq!(
-            mint_count.load(Ordering::SeqCst),
+            stub.mint_count.load(Ordering::SeqCst),
             2,
             "each permission set must mint its own token rather than share a cache entry"
         );
     }
 
+    #[tokio::test]
+    async fn owner_target_resolves_the_organization_installation() {
+        let stub = spawn_stub_github_api(&["myorg"]).await;
+        let mut client = GithubClient::new().unwrap();
+        client.api_url = stub.url;
+
+        client
+            .create_installation_token(
+                &test_github_app(),
+                &StubSigner,
+                &owner_target(),
+                TokenScope {
+                    repositories: RepoScope::All,
+                    permissions: [("packages".to_string(), "read".to_string())]
+                        .into_iter()
+                        .collect(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let requests = stub.token_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].installation_id, STUB_ORGANIZATION_INSTALLATION_ID,
+            "an owner target must resolve the installation through the account, not a repository"
+        );
+        assert_eq!(
+            requests[0].body,
+            serde_json::json!({ "permissions": { "packages": "read" } }),
+            "an owner token must omit repositories and carry only the policy's permissions"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_target_falls_back_to_the_user_installation() {
+        // `noa` is not an organization, so `/orgs/noa/installation` 404s.
+        let stub = spawn_stub_github_api(&["myorg"]).await;
+        let mut client = GithubClient::new().unwrap();
+        client.api_url = stub.url;
+
+        client
+            .create_installation_token(
+                &test_github_app(),
+                &StubSigner,
+                &InstallationTarget::Owner("noa".to_string()),
+                broad_scope(),
+            )
+            .await
+            .unwrap();
+
+        let requests = stub.token_requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].installation_id, STUB_USER_INSTALLATION_ID,
+            "a user-owned account must fall back to the user installation lookup"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_and_repository_targets_do_not_share_a_cache_entry() {
+        let stub = spawn_stub_github_api(&["myorg"]).await;
+        let mut client = GithubClient::new().unwrap();
+        client.api_url = stub.url;
+        let github_app = test_github_app();
+
+        let repo_wide = client
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                &repository_target(),
+                broad_scope(),
+            )
+            .await
+            .unwrap();
+        let owner_wide = client
+            .create_installation_token(&github_app, &StubSigner, &owner_target(), broad_scope())
+            .await
+            .unwrap();
+
+        assert_ne!(repo_wide.token, owner_wide.token);
+        assert_eq!(
+            stub.mint_count.load(Ordering::SeqCst),
+            2,
+            "an owner request must not be served a token cached for a repository request"
+        );
+    }
+
     #[test]
     fn build_create_installation_token_request_broad_omits_repositories() {
-        let request = build_create_installation_token_request(&broad_scope(), "myorg/alfa");
+        let request =
+            build_create_installation_token_request(&broad_scope(), &repository_target()).unwrap();
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json, serde_json::json!({}));
     }
 
     #[test]
     fn build_create_installation_token_request_narrow_sets_repository_by_name() {
-        let request = build_create_installation_token_request(&narrow_scope(&[]), "myorg/alfa");
+        let request =
+            build_create_installation_token_request(&narrow_scope(&[]), &repository_target())
+                .unwrap();
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(json, serde_json::json!({ "repositories": ["alfa"] }));
     }
@@ -545,12 +826,25 @@ mod tests {
     fn build_create_installation_token_request_narrow_includes_permissions() {
         let request = build_create_installation_token_request(
             &narrow_scope(&[("contents", "read")]),
-            "myorg/alfa",
-        );
+            &repository_target(),
+        )
+        .unwrap();
         let json = serde_json::to_value(&request).unwrap();
         assert_eq!(
             json,
             serde_json::json!({ "repositories": ["alfa"], "permissions": { "contents": "read" } })
+        );
+    }
+
+    #[test]
+    fn build_create_installation_token_request_rejects_a_repo_scope_on_an_owner_target() {
+        // Reachable only through a programming error, but silently widening the token to the whole
+        // installation is exactly the confusion the owner endpoint exists to avoid.
+        let error = build_create_installation_token_request(&narrow_scope(&[]), &owner_target())
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no repository was requested"),
+            "unexpected error: {error}"
         );
     }
 }
