@@ -22,6 +22,10 @@ static KNOWN_GITHUB_PERMISSIONS: LazyLock<HashSet<String>> = LazyLock::new(|| {
 
 const KNOWN_PERMISSION_VALUES: [&str; 3] = ["read", "write", "admin"];
 
+/// The claim an `owner-policy` with `allow-self-access` constrains to the requested owner. GitHub
+/// Actions OIDC tokens carry the account that owns the workflow's repository in `repository_owner`.
+pub const SELF_ACCESS_OWNER_CLAIM: &str = "repository_owner";
+
 fn known_github_permissions() -> &'static HashSet<String> {
     &KNOWN_GITHUB_PERMISSIONS
 }
@@ -43,6 +47,8 @@ pub struct Config {
     pub github_apps: Vec<GithubAppConfig>,
     #[serde(rename = "installation-policy", default)]
     pub installation_policies: Vec<InstallationPolicyConfig>,
+    #[serde(rename = "owner-policy", default)]
+    pub owner_policies: Vec<OwnerPolicyConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
@@ -147,6 +153,74 @@ impl<'de> Deserialize<'de> for InstallationPolicyConfig {
 impl InstallationPolicyConfig {
     pub fn repositories_label(&self) -> String {
         self.repositories.join(", ")
+    }
+}
+
+/// Grants a role an installation-wide token for an account (organization or user), rather than a
+/// token scoped to a single repository. Served by `POST /installation-token/{github_app}/{owner}`,
+/// which names no repository, so the minted token's scope matches the request path. Intended for
+/// account-level resources (e.g. org-owned packages) that a single-repository token cannot read.
+#[derive(Debug, Clone)]
+pub struct OwnerPolicyConfig {
+    pub github_app: String,
+    pub owners: Vec<String>,
+    pub role: String,
+    pub required_claims: BTreeMap<String, authzoo::ClaimRequirement>,
+    pub allow_self_access: bool,
+    pub permissions: BTreeMap<String, String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case")]
+struct RawOwnerPolicyConfig {
+    github_app: String,
+    owner: Option<String>,
+    owners: Option<Vec<String>>,
+    role: String,
+    #[serde(rename = "required-claims", default)]
+    required_claims: BTreeMap<String, authzoo::ClaimRequirement>,
+    #[serde(default)]
+    allow_self_access: bool,
+    // Keys are GitHub permission names (snake_case), not kebab-case.
+    #[serde(default)]
+    permissions: BTreeMap<String, String>,
+}
+
+impl<'de> Deserialize<'de> for OwnerPolicyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawOwnerPolicyConfig::deserialize(deserializer)?;
+        let owners = match (raw.owner, raw.owners) {
+            (Some(_), Some(_)) => {
+                return Err(de::Error::custom(
+                    "owner-policy must specify either owner or owners, not both",
+                ));
+            }
+            (Some(owner), None) => vec![owner],
+            (None, Some(owners)) => owners,
+            (None, None) => {
+                return Err(de::Error::custom(
+                    "owner-policy must specify either owner or owners",
+                ));
+            }
+        };
+
+        Ok(Self {
+            github_app: raw.github_app,
+            owners,
+            role: raw.role,
+            required_claims: raw.required_claims,
+            allow_self_access: raw.allow_self_access,
+            permissions: raw.permissions,
+        })
+    }
+}
+
+impl OwnerPolicyConfig {
+    pub fn owners_label(&self) -> String {
+        self.owners.join(", ")
     }
 }
 
@@ -369,14 +443,137 @@ impl Config {
                     }
                 }
             }
+            for owner_policy in &self.owner_policies {
+                if owner_policy.github_app.is_empty() {
+                    anyhow::bail!("owner-policy github-app must not be empty");
+                }
+                if !github_apps.contains(&owner_policy.github_app) {
+                    anyhow::bail!(
+                        "owner-policy references unknown github-app '{}'",
+                        owner_policy.github_app
+                    );
+                }
+                if owner_policy.owners.is_empty() {
+                    anyhow::bail!(
+                        "owner-policy for github-app '{}' must define at least one owner",
+                        owner_policy.github_app
+                    );
+                }
+                for owner in &owner_policy.owners {
+                    if !is_valid_owner_pattern(owner) {
+                        anyhow::bail!(
+                            "owner-policy for github-app '{}' must define owner as an account name or a glob like 'myorg-*' or '*', without a '/'",
+                            owner_policy.github_app
+                        );
+                    }
+                }
+                if owner_policy.role.is_empty() {
+                    anyhow::bail!(
+                        "owner-policy for github-app '{}' owner '{}' must define role",
+                        owner_policy.github_app,
+                        owner_policy.owners_label()
+                    );
+                }
+                role_validator.ensure_roles_exist([owner_policy.role.as_str()])?;
+                // An owner-policy token reaches every repository the installation can access, so
+                // `permissions` is the only thing keeping it narrower than an allowed-role token.
+                // Require it, rather than silently minting the broadest token GitHub will issue.
+                if owner_policy.permissions.is_empty() {
+                    anyhow::bail!(
+                        "owner-policy for github-app '{}' owner '{}' role '{}' must define at least one permission under [owner-policy.permissions]; an owner-wide token without narrowed permissions is what allowed-roles already grants",
+                        owner_policy.github_app,
+                        owner_policy.owners_label(),
+                        owner_policy.role
+                    );
+                }
+                if owner_policy.required_claims.is_empty() && !owner_policy.allow_self_access {
+                    anyhow::bail!(
+                        "owner-policy for github-app '{}' owner '{}' role '{}' must define at least one required-claim (or set allow-self-access)",
+                        owner_policy.github_app,
+                        owner_policy.owners_label(),
+                        owner_policy.role
+                    );
+                }
+                let role_claims = &role_validator.roles()[&owner_policy.role].claims;
+                for (claim, requirement) in &owner_policy.required_claims {
+                    if claim.is_empty() {
+                        anyhow::bail!(
+                            "owner-policy for github-app '{}' owner '{}' role '{}' required-claim names must not be empty",
+                            owner_policy.github_app,
+                            owner_policy.owners_label(),
+                            owner_policy.role
+                        );
+                    }
+                    requirement.validate(&owner_policy.role, claim)?;
+                    if role_claims.contains_key(claim) {
+                        anyhow::bail!(
+                            "owner-policy for github-app '{}' owner '{}' role '{}' required-claim '{}' duplicates a role claim",
+                            owner_policy.github_app,
+                            owner_policy.owners_label(),
+                            owner_policy.role,
+                            claim
+                        );
+                    }
+                }
+                if owner_policy.allow_self_access {
+                    if owner_policy
+                        .required_claims
+                        .contains_key(SELF_ACCESS_OWNER_CLAIM)
+                    {
+                        anyhow::bail!(
+                            "owner-policy for github-app '{}' owner '{}' role '{}' sets allow-self-access; required-claims must not also define '{SELF_ACCESS_OWNER_CLAIM}' (allow-self-access already constrains it to the requested owner)",
+                            owner_policy.github_app,
+                            owner_policy.owners_label(),
+                            owner_policy.role
+                        );
+                    }
+                    if role_claims.contains_key(SELF_ACCESS_OWNER_CLAIM) {
+                        anyhow::bail!(
+                            "owner-policy for github-app '{}' owner '{}' role '{}' sets allow-self-access, but role '{}' already constrains the '{SELF_ACCESS_OWNER_CLAIM}' claim",
+                            owner_policy.github_app,
+                            owner_policy.owners_label(),
+                            owner_policy.role,
+                            owner_policy.role
+                        );
+                    }
+                }
+                for (name, value) in &owner_policy.permissions {
+                    if !known_github_permissions().contains(name.as_str()) {
+                        warn!(
+                            github_app = %owner_policy.github_app,
+                            owner = %owner_policy.owners_label(),
+                            role = %owner_policy.role,
+                            permission = %name,
+                            "permission '{name}' is not a recognised GitHub permission. If this is intended, consider updating the permissions list."
+                        );
+                    }
+                    if !KNOWN_PERMISSION_VALUES.contains(&value.as_str()) {
+                        warn!(
+                            github_app = %owner_policy.github_app,
+                            owner = %owner_policy.owners_label(),
+                            role = %owner_policy.role,
+                            permission = %name,
+                            value = %value,
+                            "'{value}' is not a recognised access level (expected read, write or admin) for permission '{name}'. If this is intended, it will still be forwarded to GitHub."
+                        );
+                    }
+                }
+            }
             for github_app in &self.github_apps {
                 let has_installation_policy = self
                     .installation_policies
                     .iter()
                     .any(|installation_policy| installation_policy.github_app == github_app.name);
-                if github_app.allowed_roles.is_empty() && !has_installation_policy {
+                let has_owner_policy = self
+                    .owner_policies
+                    .iter()
+                    .any(|owner_policy| owner_policy.github_app == github_app.name);
+                if github_app.allowed_roles.is_empty()
+                    && !has_installation_policy
+                    && !has_owner_policy
+                {
                     anyhow::bail!(
-                        "github-app '{}' must define at least one allowed-role or installation-policy",
+                        "github-app '{}' must define at least one allowed-role, installation-policy or owner-policy",
                         github_app.name
                     );
                 }
@@ -384,6 +581,10 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn is_valid_owner_pattern(pattern: &str) -> bool {
+    !pattern.is_empty() && !pattern.contains('/')
 }
 
 fn is_valid_repo_pattern(pattern: &str) -> bool {
@@ -1269,7 +1470,7 @@ secret-key = "private-key.pem"
         let error = config.validate(false).unwrap_err();
         assert_eq!(
             error.to_string(),
-            "github-app 'default' must define at least one allowed-role or installation-policy"
+            "github-app 'default' must define at least one allowed-role, installation-policy or owner-policy"
         );
     }
 
@@ -1301,6 +1502,183 @@ role = "github-workflow"
         assert_eq!(
             error.to_string(),
             "installation-policy for github-app 'deployments' repository 'myorg/alfa' role 'github-workflow' must define at least one required-claim (or set allow-self-access)"
+        );
+    }
+
+    /// A config with a single `[[owner-policy]]`, so owner-policy tests can vary just the policy.
+    fn owner_policy_config(owner_policy: &str) -> String {
+        format!(
+            r#"
+[[role]]
+name = "github-workflow"
+audience = "idcat"
+issuer = "https://token.actions.githubusercontent.com"
+validation-key = "shared-secret"
+algorithms = ["HS256"]
+
+[[github-app]]
+name = "deployments"
+app-id = 42
+secret-key = "private-key.pem"
+
+{owner_policy}
+"#
+        )
+    }
+
+    #[test]
+    fn accepts_owner_policy_as_the_only_grant_for_a_github_app() {
+        let config: Config = toml::from_str(&owner_policy_config(
+            r#"
+[[owner-policy]]
+github-app = "deployments"
+owner = "myorg"
+role = "github-workflow"
+allow-self-access = true
+
+[owner-policy.permissions]
+packages = "read"
+"#,
+        ))
+        .unwrap();
+
+        config.validate(false).unwrap();
+    }
+
+    #[test]
+    fn rejects_owner_policy_without_permissions() {
+        let config: Config = toml::from_str(&owner_policy_config(
+            r#"
+[[owner-policy]]
+github-app = "deployments"
+owner = "myorg"
+role = "github-workflow"
+allow-self-access = true
+"#,
+        ))
+        .unwrap();
+
+        let error = config.validate(false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "owner-policy for github-app 'deployments' owner 'myorg' role 'github-workflow' must define at least one permission under [owner-policy.permissions]; an owner-wide token without narrowed permissions is what allowed-roles already grants"
+        );
+    }
+
+    #[test]
+    fn rejects_owner_policy_without_required_claims_or_self_access() {
+        let config: Config = toml::from_str(&owner_policy_config(
+            r#"
+[[owner-policy]]
+github-app = "deployments"
+owner = "myorg"
+role = "github-workflow"
+
+[owner-policy.permissions]
+packages = "read"
+"#,
+        ))
+        .unwrap();
+
+        let error = config.validate(false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "owner-policy for github-app 'deployments' owner 'myorg' role 'github-workflow' must define at least one required-claim (or set allow-self-access)"
+        );
+    }
+
+    #[test]
+    fn rejects_owner_policy_with_a_repository_shaped_owner() {
+        let config: Config = toml::from_str(&owner_policy_config(
+            r#"
+[[owner-policy]]
+github-app = "deployments"
+owner = "myorg/alfa"
+role = "github-workflow"
+allow-self-access = true
+
+[owner-policy.permissions]
+packages = "read"
+"#,
+        ))
+        .unwrap();
+
+        let error = config.validate(false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "owner-policy for github-app 'deployments' must define owner as an account name or a glob like 'myorg-*' or '*', without a '/'"
+        );
+    }
+
+    #[test]
+    fn rejects_owner_policy_that_redefines_the_self_access_claim() {
+        let config: Config = toml::from_str(&owner_policy_config(
+            r#"
+[[owner-policy]]
+github-app = "deployments"
+owner = "myorg"
+role = "github-workflow"
+allow-self-access = true
+required-claims = { repository_owner = "otherorg" }
+
+[owner-policy.permissions]
+packages = "read"
+"#,
+        ))
+        .unwrap();
+
+        let error = config.validate(false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "owner-policy for github-app 'deployments' owner 'myorg' role 'github-workflow' sets allow-self-access; required-claims must not also define 'repository_owner' (allow-self-access already constrains it to the requested owner)"
+        );
+    }
+
+    #[test]
+    fn rejects_owner_policy_that_sets_both_owner_and_owners() {
+        let error = toml::from_str::<Config>(&owner_policy_config(
+            r#"
+[[owner-policy]]
+github-app = "deployments"
+owner = "myorg"
+owners = ["myorg", "otherorg"]
+role = "github-workflow"
+allow-self-access = true
+
+[owner-policy.permissions]
+packages = "read"
+"#,
+        ))
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("owner-policy must specify either owner or owners, not both"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn rejects_owner_policy_referencing_an_unknown_github_app() {
+        let config: Config = toml::from_str(&owner_policy_config(
+            r#"
+[[owner-policy]]
+github-app = "missing"
+owner = "myorg"
+role = "github-workflow"
+allow-self-access = true
+
+[owner-policy.permissions]
+packages = "read"
+"#,
+        ))
+        .unwrap();
+
+        let error = config.validate(false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "owner-policy references unknown github-app 'missing'"
         );
     }
 

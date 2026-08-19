@@ -119,3 +119,36 @@ allow-self-access = true
 [installation-policy.permissions]
 contents = "read"
 pull_requests = "read"
+
+# An `[[owner-policy]]` grants an installation-wide token for an ACCOUNT rather
+# than a token scoped to one repository. It is served by its own endpoint,
+# `POST /installation-token/{github-app}/{owner}`, which names no repository —
+# so the scope of the token you get always matches the path you asked for. Use
+# it for account-level resources, such as org-owned packages, that a
+# single-repository token cannot read.
+#
+# `owner` (or `owners = [...]`) is an account name or glob, never `owner/repo`.
+# idcat resolves the installation from the account itself, trying
+# `/orgs/{owner}/installation` and falling back to
+# `/users/{owner}/installation`, so either kind of account works.
+#
+# `allow-self-access = true` synthesises a `repository_owner` required-claim
+# equal to the owner in the request URL — the account-level counterpart of the
+# `repository` claim an installation-policy constrains. It means "a caller may
+# only mint a token for the account its own workflow belongs to". Note this is
+# a weaker fence than the repository version: any workflow in the account
+# qualifies.
+#
+# `[owner-policy.permissions]` is REQUIRED. An owner-wide token with no
+# narrowed permissions is exactly what `allowed-roles` already grants, so idcat
+# refuses to start rather than mint one from a policy.
+#
+# Example — any workflow in myorg may mint an org-wide read-only packages token:
+[[owner-policy]]
+github-app = "deployments"
+owner = "myorg"
+role = "github-workflow"
+allow-self-access = true
+
+[owner-policy.permissions]
+packages = "read"

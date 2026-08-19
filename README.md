@@ -58,6 +58,30 @@ the token to satisfy `github-workflow` and also
 carry `repository = "myorg/gamma"`. App-level `allowed-roles` still grant access to every
 repository installation for that GitHub App.
 
+Use `[[owner-policy]]` to grant a role an installation-wide token for an account, for
+account-level resources (such as org-owned packages) that a single-repository token cannot
+read. It is served by a separate endpoint that names no repository — `POST
+/installation-token/{github-app}/{owner}` — so the token's scope always matches the request
+path. Set either `owner = "myorg"` or `owners = ["myorg", "otherorg"]`, and note that
+`allow-self-access` here constrains the token's `repository_owner` claim to the requested
+owner rather than its `repository` claim. `[owner-policy.permissions]` is required, because
+permissions are the only thing keeping an owner-wide token narrower than one granted by
+`allowed-roles`:
+
+```toml
+[[owner-policy]]
+github-app = "deployments"
+owner = "myorg"
+role = "github-workflow"
+allow-self-access = true
+
+[owner-policy.permissions]
+packages = "read"
+```
+
+An `[[installation-policy]]` never widens beyond the requested repository, and an
+`[[owner-policy]]` grants nothing on the repository endpoint; the two are independent.
+
 Mount the private keys as files. For example, in Kubernetes this could be a Secret volume mounted at `private-key-directory`, but `idcat` only reads files from the filesystem.
 
 ```sh
@@ -86,6 +110,19 @@ The response body is the GitHub installation token:
 ```text
 ghs_...
 ```
+
+Omit the repository to request an installation-wide token for the account instead. This
+requires a matching `[[owner-policy]]`, and returns a token covering every repository the
+installation can access, limited to the policy's permissions:
+
+```sh
+curl -X POST \
+  -H "Authorization: Bearer $GITHUB_WORKFLOW_JWT" \
+  http://localhost:8080/installation-token/deployments/myorg
+```
+
+`idcat` resolves the installation from the account itself, trying the organization first and
+falling back to the user installation, so `{owner}` may name either.
 
 To proxy a repository-scoped GitHub API request through an installation token, prefix the GitHub
 `/repos/{owner}/{repo}` path with `/proxy/{github-app}`. The GitHub app name selects the
