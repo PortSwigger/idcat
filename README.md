@@ -213,6 +213,18 @@ Use `--debug` to log detailed installation-token flow steps:
 cargo run -- --config-file idcat.toml --debug
 ```
 
+`--validate-config` checks the config and exits, without binding a socket,
+reaching KMS or contacting GitHub. It exits 0 for a valid config and non-zero
+with the reason otherwise, which is what manifest-validator runs this image for
+before a config change reaches a cluster:
+
+```sh
+cargo run -- --config-file idcat.toml --validate-config
+```
+
+`--disable-auth` composes with it, because a config that is only valid with auth
+disabled must not pass a check run without it.
+
 GitHub App installation IDs are cached in memory after the first lookup. Installation tokens are
 cached in memory for 50 minutes per GitHub app and repo.
 

@@ -50,6 +50,9 @@ struct Cli {
     config_path: String,
     #[arg(long = "disable-auth", default_value_t = false)]
     disable_auth: bool,
+    /// Check the config and exit, without binding a socket or reaching KMS.
+    #[arg(long = "validate-config", default_value_t = false)]
+    validate_config: bool,
     #[arg(long = "debug", default_value_t = false)]
     debug: bool,
 }
@@ -75,7 +78,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_config(path: &str, disable_auth: bool) -> anyhow::Result<()> {
+    Config::load(path)?.validate(disable_auth)
+}
+
 async fn run(cli: Cli) -> anyhow::Result<()> {
+    if cli.validate_config {
+        validate_config(&cli.config_path, cli.disable_auth)?;
+        info!(config_path = %cli.config_path, "config is valid");
+        return Ok(());
+    }
+
     let config = Config::load(&cli.config_path)?;
     config.validate(cli.disable_auth)?;
     let bind_address: SocketAddr = config.bind_address.parse()?;
@@ -471,7 +484,7 @@ fn should_return_proxy_header(name: &HeaderName) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::webhook;
+    use super::{validate_config, webhook};
     use crate::config::{GithubAppConfig, KeySource};
     use crate::error::AppError;
     use crate::github::GithubClient;
@@ -480,6 +493,7 @@ mod tests {
     use axum::body::Bytes;
     use axum::extract::{Path, State};
     use axum::http::{HeaderMap, StatusCode};
+    use std::path::PathBuf;
     use std::sync::Arc;
 
     fn test_state(github_apps: Vec<GithubAppConfig>) -> AppState {
@@ -584,5 +598,70 @@ mod tests {
 
         std::fs::remove_file(&secret_file).ok();
         assert_eq!(status, StatusCode::ACCEPTED);
+    }
+
+    const VALID: &str = r#"
+bind-address = "0.0.0.0:8080"
+
+[[role]]
+name = "github-workflow"
+audience = "idcat"
+issuer = "https://token.actions.githubusercontent.com"
+validation-key = "shared-secret"
+algorithms = ["HS256"]
+
+[[github-app]]
+name = "deployments"
+app-id = 42
+secret-key = "private-key.pem"
+allowed-roles = ["github-workflow"]
+"#;
+
+    fn write_config(name: &str, content: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("idcat-{name}.toml"));
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn validate_config_accepts_a_valid_config() {
+        let path = write_config("valid", VALID);
+
+        validate_config(path.to_str().unwrap(), false).unwrap();
+    }
+
+    #[test]
+    fn validate_config_rejects_a_config_with_no_github_app() {
+        let content = VALID.split("[[github-app]]").next().unwrap();
+        let path = write_config("no-github-app", content);
+
+        let error = validate_config(path.to_str().unwrap(), false).unwrap_err();
+
+        assert!(
+            error.to_string().contains("github-app"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_config_reports_where_a_missing_file_was_looked_for() {
+        let error = validate_config("/nonexistent/idcat.toml", false).unwrap_err();
+
+        assert!(
+            error.to_string().contains("/nonexistent/idcat.toml"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_config_accepts_a_roleless_config_only_with_auth_disabled() {
+        let content = VALID.split("[[role]]").next().unwrap().to_string()
+            + VALID.split_once("[[github-app]]").unwrap().1;
+        let content = format!("[[github-app]]{content}");
+        let path = write_config("no-roles", &content);
+        let path = path.to_str().unwrap();
+
+        validate_config(path, false).unwrap_err();
+        validate_config(path, true).unwrap();
     }
 }
