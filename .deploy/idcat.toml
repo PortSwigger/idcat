@@ -28,4 +28,5 @@ webhook-target = "nats"
 
 [nats]
 endpoint = "nats://nats.nats.svc"
+subject-base = "idcat.github.events"
 token-path = "/var/run/secrets/tokens/nats"
