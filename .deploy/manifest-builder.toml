@@ -5,3 +5,4 @@ replicas = 2
 args = ["--debug"]
 external-secrets = ["/app-keys"]
 config = { "/config/idcat.toml" = "idcat.toml" }
+custom-token-audiences = ["nats"]

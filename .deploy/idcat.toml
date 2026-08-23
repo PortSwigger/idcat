@@ -24,3 +24,8 @@ name = "nresare-buildsystem"
 allowed-roles = ["buildkite", "relcoord", "manual"]
 app-id = 3511383
 secret-key = "nresare-buildsystem.key"
+webhook-target = "nats"
+
+[nats]
+endpoint = "nats://nats.nats.svc"
+token-path = "/var/run/secrets/tokens/nats"
