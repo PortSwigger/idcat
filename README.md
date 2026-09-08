@@ -138,6 +138,48 @@ curl -X GET \
   http://localhost:8080/proxy/deployments/repos/github_user/repo_name/contents/README.md
 ```
 
+### The human token path
+
+A person authenticated by Teleport, holding an approved access request, can obtain a token for one
+exact repository:
+
+```sh
+curl -X POST \
+  -H "Authorization: Bearer $TELEPORT_JWT" \
+  https://idcat.example.invalid/human/installation-token/source-reader/myorg/pilot
+```
+
+This route is separate from `/installation-token/...` in every respect that matters:
+
+| | `/installation-token/...` | `/human/installation-token/...` |
+| --- | --- | --- |
+| Validated by | `authzoo`, against `[[role]]` | idcat's own validator, against `[[human-role]]` |
+| Authorized by | `allowed-roles` or `[[installation-policy]]` | `[[human-policy]]` only |
+| Repository | may be a glob | exactly one, no wildcards |
+| Permissions | optional | required |
+| On no match | falls back to `allowed-roles` | refused |
+| `--disable-auth` | honoured | not honoured |
+| Token cache | shared | partitioned by validated subject and access request |
+
+A request that does not match exactly one `[[human-policy]]` is refused before the token is
+validated and before GitHub is contacted. A workload token cannot satisfy a human policy, and a
+human token cannot satisfy a workload one.
+
+Each allow and deny is recorded at `info` as a structured event carrying the subject, the Teleport
+request, the App, the exact repository, the exact permissions, the expiry and a truncated digest of
+the token. The token itself, the Authorization header and the App private key are never logged.
+
+This route must be reachable only through the Teleport Application Service; it is not safe to
+expose to the internet. Two things are worth stating plainly to whoever operates it:
+
+* A short Teleport approval window stops new sessions from starting, and an installation token
+  expires within the hour. Neither removes source that has already been cloned to a machine, nor
+  the history that came with it.
+* idcat opts token requests into GitHub's stateless (JWT-format) installation tokens, which are
+  verified from their own signature. Whether revoking a token, or suspending the App installation,
+  affects one that has already been issued is worth confirming against GitHub's documentation
+  before relying on either as an emergency stop.
+
 ## Webhooks
 
 idcat can receive GitHub webhook callbacks and bridge them into NATS. GitHub
