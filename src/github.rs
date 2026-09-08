@@ -39,6 +39,7 @@ struct InstallationTokenCacheKey {
     github_app: String,
     repo: String,
     scope: crate::service::TokenScope,
+    requester: crate::service::Requester,
 }
 
 #[derive(Clone)]
@@ -117,11 +118,13 @@ impl GithubClient {
         signer: &dyn Signer,
         repo: &str,
         scope: crate::service::TokenScope,
+        requester: crate::service::Requester,
     ) -> anyhow::Result<InstallationTokenResponse> {
         let token_cache_key = InstallationTokenCacheKey {
             github_app: github_app.name.clone(),
             repo: repo.to_string(),
             scope,
+            requester,
         };
         if let Some(token) = self.cached_installation_token(&token_cache_key).await {
             debug!(
@@ -396,6 +399,153 @@ mod tests {
     /// Stub GitHub API that resolves a fixed installation id and mints a
     /// uniquely-numbered token on each POST, returning the running mint count
     /// so a cache hit (which skips the POST) is observable from the test.
+    fn person(subject: &str, request_id: &str) -> crate::service::Requester {
+        crate::service::Requester::Person {
+            subject: subject.to_owned(),
+            request_id: Some(request_id.to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn two_people_are_never_served_each_others_token() {
+        let (api_url, mint_count) = spawn_stub_github_api().await;
+        let mut client = GithubClient::new().unwrap();
+        client.api_url = api_url;
+        let github_app = test_github_app();
+
+        let first = client
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                "myorg/alfa",
+                narrow_scope(&[("contents", "read")]),
+                person("first@example.invalid", "req-1"),
+            )
+            .await
+            .unwrap();
+        // Same App, same repository, same permissions: everything about the request matches except
+        // who is asking. Each person must still receive their own token.
+        let second = client
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                "myorg/alfa",
+                narrow_scope(&[("contents", "read")]),
+                person("second@example.invalid", "req-2"),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(
+            first.token, second.token,
+            "two people were served the same cached token"
+        );
+        assert_eq!(mint_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_second_approval_for_one_person_mints_a_fresh_token() {
+        let (api_url, mint_count) = spawn_stub_github_api().await;
+        let mut client = GithubClient::new().unwrap();
+        client.api_url = api_url;
+        let github_app = test_github_app();
+
+        let first = client
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                "myorg/alfa",
+                narrow_scope(&[("contents", "read")]),
+                person("alex@example.invalid", "req-1"),
+            )
+            .await
+            .unwrap();
+        let second = client
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                "myorg/alfa",
+                narrow_scope(&[("contents", "read")]),
+                person("alex@example.invalid", "req-2"),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(
+            first.token, second.token,
+            "a fresh approval must not revive the token issued under the previous one"
+        );
+        assert_eq!(mint_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn one_person_reuses_their_own_cached_token_within_an_approval() {
+        let (api_url, mint_count) = spawn_stub_github_api().await;
+        let mut client = GithubClient::new().unwrap();
+        client.api_url = api_url;
+        let github_app = test_github_app();
+
+        let first = client
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                "myorg/alfa",
+                narrow_scope(&[("contents", "read")]),
+                person("alex@example.invalid", "req-1"),
+            )
+            .await
+            .unwrap();
+        let again = client
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                "myorg/alfa",
+                narrow_scope(&[("contents", "read")]),
+                person("alex@example.invalid", "req-1"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first.token, again.token);
+        assert_eq!(
+            mint_count.load(Ordering::SeqCst),
+            1,
+            "partitioning must not defeat caching within a single approval"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_person_is_never_served_the_shared_workload_token() {
+        let (api_url, mint_count) = spawn_stub_github_api().await;
+        let mut client = GithubClient::new().unwrap();
+        client.api_url = api_url;
+        let github_app = test_github_app();
+
+        let workload = client
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                "myorg/alfa",
+                narrow_scope(&[("contents", "read")]),
+                crate::service::Requester::Workload,
+            )
+            .await
+            .unwrap();
+        let human = client
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                "myorg/alfa",
+                narrow_scope(&[("contents", "read")]),
+                person("alex@example.invalid", "req-1"),
+            )
+            .await
+            .unwrap();
+
+        assert_ne!(workload.token, human.token);
+        assert_eq!(mint_count.load(Ordering::SeqCst), 2);
+    }
+
     async fn spawn_stub_github_api() -> (String, Arc<AtomicUsize>) {
         use axum::Json;
         use axum::routing::{get, post};
@@ -465,14 +615,26 @@ mod tests {
 
         // A broad-scoped caller mints and caches a token for the repo first.
         let broad = client
-            .create_installation_token(&github_app, &StubSigner, "myorg/alfa", broad_scope())
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                "myorg/alfa",
+                broad_scope(),
+                crate::service::Requester::Workload,
+            )
             .await
             .unwrap();
         // A caller authorized only for the requested repo then asks for the same
         // repo. It must get its own freshly-minted, repo-scoped token — not the
         // cached broad token covering the whole installation.
         let narrow = client
-            .create_installation_token(&github_app, &StubSigner, "myorg/alfa", narrow_scope(&[]))
+            .create_installation_token(
+                &github_app,
+                &StubSigner,
+                "myorg/alfa",
+                narrow_scope(&[]),
+                crate::service::Requester::Workload,
+            )
             .await
             .unwrap();
 
@@ -501,6 +663,7 @@ mod tests {
                 &StubSigner,
                 "myorg/alfa",
                 narrow_scope(&[("contents", "read")]),
+                crate::service::Requester::Workload,
             )
             .await
             .unwrap();
@@ -512,6 +675,7 @@ mod tests {
                 &StubSigner,
                 "myorg/alfa",
                 narrow_scope(&[("contents", "write")]),
+                crate::service::Requester::Workload,
             )
             .await
             .unwrap();

@@ -119,3 +119,64 @@ allow-self-access = true
 [installation-policy.permissions]
 contents = "read"
 pull_requests = "read"
+
+# ---------------------------------------------------------------------------
+# The human token path
+# ---------------------------------------------------------------------------
+#
+# `[[human-role]]` and `[[human-policy]]` let a *person*, authenticated by
+# Teleport and holding an approved access request, obtain a token for one exact
+# repository. They are deliberately separate from `[[role]]` and
+# `[[installation-policy]]`:
+#
+#   * a workload token can never satisfy a human policy, and vice versa — the
+#     two are validated by different code against different issuers, and
+#     neither namespace may name the other's roles;
+#   * there is no `allowed-roles` fallback. A request that does not match
+#     exactly one `[[human-policy]]` is refused, not retried more broadly;
+#   * there are no wildcards. One policy names one repository;
+#   * `permissions` is required, since it is the only thing keeping the token
+#     narrower than the whole App installation;
+#   * `--disable-auth` does not apply. The human route has no unauthenticated
+#     mode.
+#
+# Requests arrive at:
+#
+#     POST /human/installation-token/{github-app}/{owner}/{repo}
+#
+# This route must be reachable only through the Teleport Application Service.
+#
+# Every value below is an example. Replace them with the real issuer,
+# application uri, JWKS URL, Teleport role, App and repository.
+#
+# [[human-role]]
+# name = "pilot-repo-reader"
+# # The exact `iss` the token carries.
+# issuer = "https://teleport.example.com"
+# # The exact `aud`. This is the Teleport APPLICATION URI, which is not
+# # necessarily the hostname a person types.
+# audience = "https://idcat.teleport.example.com:443"
+# # Given explicitly. idcat does not use OpenID discovery for this issuer.
+# # Must end in /.well-known/jwks.json.
+# jwks-url = "https://teleport.example.com/.well-known/jwks.json"
+# # The exact Teleport role string. Membership is tested against the JSON array
+# # in `roles-claim` by exact string equality: a role that merely contains this
+# # name does not match, and a scalar claim of the same name is refused
+# # outright.
+# teleport-role = "github-app-token-pilot-repo"
+# # Defaults to "roles".
+# roles-claim = "roles"
+# # Asymmetric algorithms only; an HMAC value will not parse.
+# algorithms = ["RS256"]
+# # Optional. A scalar claim naming the Teleport access request or session,
+# # recorded on issuance so an operator can join the approval to the token.
+# request-id-claim = "teleport_request_id"
+#
+# [[human-policy]]
+# github-app = "source-reader"
+# # Exactly one repository, in owner/name form. Globs are refused at startup.
+# repository = "myorg/pilot"
+# human-role = "pilot-repo-reader"
+#
+# [human-policy.permissions]
+# contents = "read"

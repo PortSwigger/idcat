@@ -28,6 +28,7 @@ base64 = "0.23"
 clap = { version = "4.6", features = ["derive"] }
 hex = "0.4"
 hmac = "0.13"
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "native-tls"] }
 rsa = { version = "0.9", features = ["sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
@@ -42,9 +43,6 @@ tower-http = { version = "0.7", features = ["trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 wildmatch = "2.4"
-
-[dev-dependencies]
-jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 
 [[example]]
 name = "kms_sign_jwt"

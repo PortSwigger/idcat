@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The idcat contributors
 
+mod audit;
 mod config;
 mod error;
 mod github;
+mod human;
 mod jwt;
 #[cfg(feature = "kms")]
 #[allow(dead_code)]
@@ -12,12 +14,14 @@ mod nats;
 mod secret;
 mod service;
 mod signer;
+#[cfg(test)]
+mod testkeys;
 mod webhook;
 
 use crate::config::Config;
 use crate::error::AppError;
 use crate::github::InstallationTokenResponse;
-use crate::service::{AppState, build_app_state};
+use crate::service::{AppState, Requester, build_app_state};
 use anyhow::Context;
 use axum::body::{Body, Bytes};
 use axum::extract::{OriginalUri, Path, State};
@@ -103,6 +107,10 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         .route(
             "/installation-token/{github_app}/{owner}/{repo}",
             post(installation_token),
+        )
+        .route(
+            "/human/installation-token/{github_app}/{owner}/{repo}",
+            post(human_installation_token),
         )
         .route(
             "/proxy/{github_app}/repos/{owner}/{repo}",
@@ -231,6 +239,19 @@ async fn installation_token(
 ) -> Result<String, AppError> {
     let repo = format!("{owner}/{repo}");
     let token = create_installation_token_for_repo(&github_app, &repo, &state, &headers).await?;
+    Ok(token.token)
+}
+
+/// The human token route. Separate from [`installation_token`] so that it can be reached only
+/// through the Teleport Application Service, and so that a workload caller cannot arrive here by
+/// accident: the two routes share no authorization code.
+async fn human_installation_token(
+    Path((github_app, owner, repo)): Path<(String, String, String)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<String, AppError> {
+    let repo = format!("{owner}/{repo}");
+    let token = create_human_installation_token(&github_app, &repo, &state, &headers).await?;
     Ok(token.token)
 }
 
@@ -383,9 +404,79 @@ async fn create_installation_token_for_repo(
     debug!(github_app = %github_app_name, repo = %repo, ?token_scope, "requesting GitHub installation access token");
     let token = state
         .github
-        .create_installation_token(github_app, signer.as_ref(), repo, token_scope)
+        .create_installation_token(
+            github_app,
+            signer.as_ref(),
+            repo,
+            token_scope,
+            Requester::Workload,
+        )
         .await?;
     debug!(github_app = %github_app_name, repo = %repo, expires_at = %token.expires_at, "GitHub installation access token created");
+    Ok(token)
+}
+
+async fn create_human_installation_token(
+    github_app_name: &str,
+    repo: &str,
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<InstallationTokenResponse, AppError> {
+    // Unlike the workload path there is no `--disable-auth` branch: a missing or malformed
+    // Authorization header is a denial, recorded as one.
+    let bearer_token = extract_bearer_token(headers).inspect_err(|error| {
+        audit::record_denial(None, github_app_name, repo, &error.to_string());
+    })?;
+
+    let github_app = state.github_app(github_app_name).inspect_err(|error| {
+        audit::record_denial(None, github_app_name, repo, &error.to_string());
+    })?;
+
+    let (token_scope, identity) = state
+        .authorize_human(github_app, repo, Some(bearer_token.as_str()))
+        .await
+        .inspect_err(|error| {
+            audit::record_denial(None, github_app_name, repo, &error.to_string());
+        })?;
+
+    let signer = state.signer(&github_app.secret_key).map_err(|error| {
+        audit::record_denial(
+            Some(&identity.subject),
+            github_app_name,
+            repo,
+            &error.to_string(),
+        );
+        AppError::from(error)
+    })?;
+
+    let token = state
+        .github
+        .create_installation_token(
+            github_app,
+            signer.as_ref(),
+            repo,
+            token_scope.clone(),
+            Requester::person(&identity),
+        )
+        .await
+        .map_err(|error| {
+            audit::record_denial(
+                Some(&identity.subject),
+                github_app_name,
+                repo,
+                &error.to_string(),
+            );
+            AppError::from(error)
+        })?;
+
+    audit::record_issuance(
+        &identity,
+        github_app_name,
+        repo,
+        &token_scope.permissions,
+        &token.expires_at,
+        &token.token,
+    );
     Ok(token)
 }
 
@@ -435,6 +526,8 @@ mod tests {
         AppState {
             github_apps: Arc::new(github_apps),
             installation_policies: Arc::new(Vec::new()),
+            human_policies: Arc::new(Vec::new()),
+            human_roles: Arc::new(std::collections::BTreeMap::new()),
             token_validator: TokenValidator::new(Vec::new(), true).unwrap(),
             github: GithubClient::new().unwrap(),
             webhook_publisher: None,

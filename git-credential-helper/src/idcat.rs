@@ -75,7 +75,8 @@ mod tests {
         let config = Config {
             github_app: "deployments".to_owned(),
             idcat_endpoint: "https://idcat.example.test/base".to_owned(),
-            token_source: TokenSource::Command("unused".to_owned()),
+            repository: None,
+            token_source: TokenSource::ShellCommand("unused".to_owned()),
         };
         let repo = Repo {
             owner: "noa".to_owned(),

@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: MIT
 // SPDX-FileCopyrightText: The idcat contributors
 
-use crate::config::{Config, GithubAppConfig, InstallationPolicyConfig, KeySource, WebhookTarget};
+use crate::config::{
+    Config, GithubAppConfig, HumanPolicyConfig, HumanRoleConfig, InstallationPolicyConfig,
+    KeySource, WebhookTarget,
+};
 use crate::error::AppError;
 use crate::github::GithubClient;
+use crate::human::{HumanTokenError, HumanTokenValidator};
 use crate::nats::WebhookPublisher;
 use crate::secret::FilePrivateKeyStore;
 use crate::signer::{LocalSigner, Signer};
@@ -36,6 +40,8 @@ impl TokenScope {
 pub struct AppState {
     pub github_apps: Arc<Vec<GithubAppConfig>>,
     pub installation_policies: Arc<Vec<InstallationPolicyConfig>>,
+    pub human_policies: Arc<Vec<HumanPolicyConfig>>,
+    pub human_roles: Arc<BTreeMap<String, HumanRole>>,
     pub token_validator: TokenValidator,
     pub github: GithubClient,
     pub webhook_publisher: Option<WebhookPublisher>,
@@ -64,6 +70,8 @@ pub async fn build_app_state(config: &Config, disable_auth: bool) -> anyhow::Res
     Ok(AppState {
         github_apps: Arc::new(config.github_apps.clone()),
         installation_policies: Arc::new(config.installation_policies.clone()),
+        human_policies: Arc::new(config.human_policies.clone()),
+        human_roles: Arc::new(build_human_roles(&config.human_roles)?),
         token_validator: TokenValidator::new(config.roles.clone(), disable_auth)?,
         github: GithubClient::new()?,
         webhook_publisher,
@@ -143,6 +151,99 @@ impl AppState {
         )))
     }
 
+    /// Authorizes a person's request for a token covering exactly `repo`.
+    ///
+    /// This path is deliberately not a variant of [`Self::authorize_github_app`]. It never
+    /// consults `allowed-roles`, never widens the scope, and never retries against another
+    /// policy: a request that does not match exactly one `[[human-policy]]` is refused. The
+    /// repository is resolved from configuration *before* the token is validated and long before
+    /// GitHub is contacted, so a request for the wrong repository costs no upstream call.
+    pub async fn authorize_human(
+        &self,
+        github_app: &GithubAppConfig,
+        repo: &str,
+        bearer_token: Option<&str>,
+    ) -> Result<(TokenScope, HumanIdentity), AppError> {
+        // `--disable-auth` is a local development affordance for the workload path. Honouring it
+        // here would turn the human route into an unauthenticated token minter, so it does not
+        // apply: the human path has no unauthenticated mode.
+        let bearer_token = bearer_token
+            .ok_or_else(|| AppError::Unauthorized("missing Authorization header".to_string()))?;
+
+        let Some(human_policy) = self.human_policies.iter().find(|human_policy| {
+            human_policy.github_app == github_app.name && human_policy.repository == repo
+        }) else {
+            debug!(
+                github_app = %github_app.name,
+                repo = %repo,
+                "no human-policy names this github-app and repository"
+            );
+            return Err(AppError::Unauthorized(format!(
+                "no human-policy authorizes github-app '{}' for repository '{}'",
+                github_app.name, repo
+            )));
+        };
+
+        let human_role = self
+            .human_roles
+            .get(&human_policy.human_role)
+            .ok_or_else(|| {
+                // Startup validation rejects this, so reaching it means the state was built by
+                // some path that skipped validation.
+                AppError::Internal(format!(
+                    "human-policy references unknown human-role '{}'",
+                    human_policy.human_role
+                ))
+            })?;
+
+        let claims = human_role
+            .validator
+            .validate(
+                bearer_token,
+                &human_role.config.roles_claim,
+                &human_role.config.teleport_role,
+                &human_role.config.required_claims,
+            )
+            .await
+            .map_err(|error| match error {
+                HumanTokenError::KeysUnavailable => AppError::Internal(
+                    "Teleport validation keys could not be retrieved".to_string(),
+                ),
+                error => {
+                    debug!(
+                        github_app = %github_app.name,
+                        repo = %repo,
+                        human_role = %human_policy.human_role,
+                        error = %error,
+                        "human token rejected"
+                    );
+                    AppError::Unauthorized(format!(
+                        "token did not satisfy human-role '{}' for repository '{}'",
+                        human_policy.human_role, repo
+                    ))
+                }
+            })?;
+
+        let identity = HumanIdentity {
+            subject: claims.subject().to_string(),
+            request_id: human_role
+                .config
+                .request_id_claim
+                .as_deref()
+                .and_then(|claim| claims.claim_str(claim))
+                .map(str::to_string),
+            human_role: human_policy.human_role.clone(),
+        };
+
+        Ok((
+            TokenScope {
+                repositories: RepoScope::OnlyRequested,
+                permissions: human_policy.permissions.clone(),
+            },
+            identity,
+        ))
+    }
+
     pub fn signer(&self, secret_key: &str) -> anyhow::Result<Box<dyn Signer>> {
         match self.key_source {
             KeySource::Local => {
@@ -167,6 +268,80 @@ impl AppState {
             }
         }
     }
+}
+
+/// Who a token is being minted for. This is part of the installation-token cache key, so a token
+/// minted for one person is never handed to another, and a person's token is never served from
+/// the shared workload entry.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum Requester {
+    /// A workload identity. These legitimately share a cache entry: the token they receive depends
+    /// only on the App, repository and scope, and no person is accountable for it.
+    Workload,
+    /// A person. Partitioned by validated subject *and* the access request that authorised them,
+    /// so a second approval for the same person yields a fresh token rather than reviving the one
+    /// issued under the previous approval.
+    Person {
+        subject: String,
+        request_id: Option<String>,
+    },
+}
+
+impl Requester {
+    pub fn person(identity: &HumanIdentity) -> Self {
+        Self::Person {
+            subject: identity.subject.clone(),
+            request_id: identity.request_id.clone(),
+        }
+    }
+}
+
+/// A configured Teleport issuer together with the validator built for it. The validator holds the
+/// JWKS cache, so it is built once at startup rather than per request.
+#[derive(Clone)]
+pub struct HumanRole {
+    pub config: HumanRoleConfig,
+    pub validator: HumanTokenValidator,
+}
+
+/// Who idcat believes is asking, carried from authorization through to the token request so that
+/// the issuance record names a person and the token cache cannot be shared between people.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HumanIdentity {
+    /// The validated `sub` of the Teleport token.
+    pub subject: String,
+    /// The Teleport access request or session the approval came from, when the issuer supplies it.
+    pub request_id: Option<String>,
+    /// The `[[human-role]]` that authorised this request.
+    pub human_role: String,
+}
+
+fn build_human_roles(
+    human_roles: &[HumanRoleConfig],
+) -> anyhow::Result<BTreeMap<String, HumanRole>> {
+    human_roles
+        .iter()
+        .map(|config| {
+            let algorithms = config
+                .algorithms
+                .iter()
+                .map(|algorithm| algorithm.to_algorithm())
+                .collect();
+            let validator = HumanTokenValidator::from_http(
+                &config.issuer,
+                &config.audience,
+                &config.jwks_url,
+                algorithms,
+            )?;
+            Ok((
+                config.name.clone(),
+                HumanRole {
+                    config: config.clone(),
+                    validator,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn claims_for_request(
@@ -258,6 +433,8 @@ mod tests {
         AppState {
             github_apps: Arc::new(github_apps),
             installation_policies: Arc::new(installation_policies),
+            human_policies: Arc::new(Vec::new()),
+            human_roles: Arc::new(BTreeMap::new()),
             token_validator: TokenValidator::new(Vec::new(), true).unwrap(),
             github: GithubClient::new().unwrap(),
             webhook_publisher: None,
@@ -605,5 +782,403 @@ mod tests {
             .authorize_github_app(&github_app, "evilorg/alfa", Some(&token))
             .unwrap_err();
         assert!(matches!(error, AppError::Unauthorized(_)));
+    }
+}
+
+/// The pilot's human token path: one exact repository, one exact Teleport role, no fallback.
+///
+/// Every token here is synthetic and signed with a key generated in-process. Nothing in this
+/// module may be given a real Teleport token.
+#[cfg(test)]
+mod human_tests {
+    use super::*;
+    use crate::config::{HumanJwtAlgorithm, HumanPolicyConfig, HumanRoleConfig};
+    use crate::human::HumanTokenValidator;
+    use crate::secret::FilePrivateKeyStore;
+    use crate::testkeys::{TeleportClaims, other_keys, test_keys};
+    use serde_json::json;
+
+    const ISSUER: &str = "https://teleport.example.invalid";
+    const AUDIENCE: &str = "https://idcat.teleport.example.invalid:443";
+    const TELEPORT_ROLE: &str = "github-app-token-pilot-repo";
+    const HUMAN_ROLE: &str = "pilot-repo-reader";
+    const APP: &str = "source-reader";
+    const PILOT_REPO: &str = "myorg/pilot";
+    const OTHER_REPO: &str = "myorg/other";
+    const REQUEST_ID_CLAIM: &str = "teleport_request_id";
+
+    fn human_role_config() -> HumanRoleConfig {
+        HumanRoleConfig {
+            name: HUMAN_ROLE.to_string(),
+            issuer: ISSUER.to_string(),
+            audience: AUDIENCE.to_string(),
+            jwks_url: format!("{ISSUER}/.well-known/jwks.json"),
+            teleport_role: TELEPORT_ROLE.to_string(),
+            roles_claim: "roles".to_string(),
+            algorithms: vec![HumanJwtAlgorithm::Rs256],
+            request_id_claim: Some(REQUEST_ID_CLAIM.to_string()),
+            required_claims: BTreeMap::new(),
+        }
+    }
+
+    fn human_policy(repository: &str, permissions: &[(&str, &str)]) -> HumanPolicyConfig {
+        HumanPolicyConfig {
+            github_app: APP.to_string(),
+            repository: repository.to_string(),
+            human_role: HUMAN_ROLE.to_string(),
+            permissions: permissions
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        }
+    }
+
+    fn github_app(allowed_roles: Vec<String>) -> GithubAppConfig {
+        GithubAppConfig {
+            name: APP.to_string(),
+            app_id: 42,
+            secret_key: "private-key.pem".to_string(),
+            webhook_target: None,
+            webhook_validation_secret_file: None,
+            allowed_roles,
+        }
+    }
+
+    /// Builds state whose human role validates against an in-process JWKS, so no test reaches the
+    /// network.
+    fn state(policies: Vec<HumanPolicyConfig>, app: GithubAppConfig) -> AppState {
+        let config = human_role_config();
+        let validator = HumanTokenValidator::from_static_jwks(
+            &config.issuer,
+            &config.audience,
+            test_keys().jwks.clone(),
+            vec![jsonwebtoken::Algorithm::RS256],
+        );
+        AppState {
+            github_apps: Arc::new(vec![app]),
+            installation_policies: Arc::new(Vec::new()),
+            human_policies: Arc::new(policies),
+            human_roles: Arc::new(BTreeMap::from([(
+                HUMAN_ROLE.to_string(),
+                HumanRole { config, validator },
+            )])),
+            token_validator: TokenValidator::new(Vec::new(), true).unwrap(),
+            github: GithubClient::new().unwrap(),
+            webhook_publisher: None,
+            key_source: KeySource::Local,
+            private_key_store: FilePrivateKeyStore::new("/var/run/secrets/idcat"),
+            #[cfg(feature = "kms")]
+            kms_signers: None,
+        }
+    }
+
+    fn default_state() -> AppState {
+        state(
+            vec![human_policy(PILOT_REPO, &[("contents", "read")])],
+            github_app(Vec::new()),
+        )
+    }
+
+    fn claims(subject: &str) -> TeleportClaims {
+        let mut claims = TeleportClaims::new(subject, ISSUER, AUDIENCE, json!([TELEPORT_ROLE]));
+        claims.traits = None;
+        claims
+    }
+
+    /// A Teleport token with a request id, matching what the Application Service issues after an
+    /// approved access request.
+    fn approved_token(subject: &str, request_id: &str) -> String {
+        let claims = claims(subject);
+        let mut value = serde_json::to_value(&claims).unwrap();
+        value[REQUEST_ID_CLAIM] = json!(request_id);
+        test_keys().sign(&value)
+    }
+
+    async fn authorize(
+        state: &AppState,
+        repo: &str,
+        token: &str,
+    ) -> Result<(TokenScope, HumanIdentity), AppError> {
+        let app = state.github_app(APP).unwrap().clone();
+        state.authorize_human(&app, repo, Some(token)).await
+    }
+
+    #[tokio::test]
+    async fn exact_person_role_app_and_repository_is_authorized() {
+        let state = default_state();
+        let token = approved_token("alex.mason@example.invalid", "req-1");
+
+        let (scope, identity) = authorize(&state, PILOT_REPO, &token).await.unwrap();
+
+        assert_eq!(scope.repositories, RepoScope::OnlyRequested);
+        assert_eq!(
+            scope.permissions,
+            BTreeMap::from([("contents".to_string(), "read".to_string())])
+        );
+        assert_eq!(identity.subject, "alex.mason@example.invalid");
+        assert_eq!(identity.request_id.as_deref(), Some("req-1"));
+        assert_eq!(identity.human_role, HUMAN_ROLE);
+    }
+
+    #[tokio::test]
+    async fn right_person_and_role_but_wrong_repository_is_denied() {
+        let state = default_state();
+        let token = approved_token("alex.mason@example.invalid", "req-1");
+
+        let error = authorize(&state, OTHER_REPO, &token).await.unwrap_err();
+
+        // The policy lookup fails before the token is validated and long before GitHub is asked
+        // for anything, so this denial costs no upstream call.
+        assert!(
+            matches!(&error, AppError::Unauthorized(message)
+                if message.contains("no human-policy authorizes")),
+            "expected an unauthorized policy-lookup failure, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn approval_for_one_repository_cannot_mint_for_a_renamed_repository() {
+        let state = default_state();
+        let token = approved_token("alex.mason@example.invalid", "req-1");
+
+        assert!(
+            authorize(&state, "myorg/pilot-renamed", &token)
+                .await
+                .is_err()
+        );
+        assert!(authorize(&state, "myorg/Pilot", &token).await.is_err());
+        assert!(authorize(&state, "otherorg/pilot", &token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_minted_scope_is_the_policy_permissions_not_the_installation() {
+        let state = default_state();
+        let token = approved_token("alex.mason@example.invalid", "req-1");
+
+        let (scope, _) = authorize(&state, PILOT_REPO, &token).await.unwrap();
+
+        assert_eq!(scope.repositories, RepoScope::OnlyRequested);
+        assert!(
+            !scope.permissions.contains_key("administration"),
+            "a human token must carry only the permissions its policy names"
+        );
+        assert_eq!(scope.permissions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_request_through_a_different_github_app_is_denied() {
+        let other_app = GithubAppConfig {
+            name: "another-app".to_string(),
+            ..github_app(Vec::new())
+        };
+        let state = AppState {
+            github_apps: Arc::new(vec![github_app(Vec::new()), other_app]),
+            ..default_state()
+        };
+        let token = approved_token("alex.mason@example.invalid", "req-1");
+        let app = state.github_app("another-app").unwrap().clone();
+
+        assert!(
+            state
+                .authorize_human(&app, PILOT_REPO, Some(&token))
+                .await
+                .is_err(),
+            "the policy names one App; another App installation must not satisfy it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_without_the_exact_teleport_role_is_denied() {
+        let state = default_state();
+        let mut raw = claims("alex.mason@example.invalid");
+        raw.roles = json!(["some-other-role"]);
+        let token = test_keys().sign(&raw);
+
+        assert!(authorize(&state, PILOT_REPO, &token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_wrong_audience_issuer_signature_or_expiry_is_denied() {
+        let state = default_state();
+        let cases: Vec<(&str, String)> = vec![
+            ("wrong audience", {
+                let mut raw = claims("a@example.invalid");
+                raw.aud = "https://idcat.example.invalid".to_string();
+                test_keys().sign(&raw)
+            }),
+            ("wrong issuer", {
+                let mut raw = claims("a@example.invalid");
+                raw.iss = "https://teleport.other.invalid".to_string();
+                test_keys().sign(&raw)
+            }),
+            (
+                "wrong signature",
+                other_keys().sign(&claims("a@example.invalid")),
+            ),
+            ("expired", {
+                let mut raw = claims("a@example.invalid");
+                raw.exp = crate::testkeys::now() - 1;
+                test_keys().sign(&raw)
+            }),
+        ];
+
+        for (case, token) in cases {
+            let error = authorize(&state, PILOT_REPO, &token).await.unwrap_err();
+            assert!(
+                matches!(error, AppError::Unauthorized(_)),
+                "{case} must be refused outright, not retried against another path"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_missing_authorization_header_is_denied() {
+        let state = default_state();
+        let app = state.github_app(APP).unwrap().clone();
+
+        assert!(state.authorize_human(&app, PILOT_REPO, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn the_human_path_never_falls_back_to_allowed_roles() {
+        // The App grants a workload role a broad token. A human request that fails its policy must
+        // not be rescued by that path.
+        let state = state(
+            vec![human_policy(PILOT_REPO, &[("contents", "read")])],
+            github_app(vec!["some-workload-role".to_string()]),
+        );
+        let mut raw = claims("alex.mason@example.invalid");
+        raw.roles = json!(["not-the-pilot-role"]);
+        let token = test_keys().sign(&raw);
+
+        let error = authorize(&state, PILOT_REPO, &token).await.unwrap_err();
+
+        assert!(matches!(error, AppError::Unauthorized(_)));
+    }
+
+    #[tokio::test]
+    async fn a_wrong_repository_is_denied_even_when_the_app_has_broad_allowed_roles() {
+        // The lookup-miss branch must not be rescued by `allowed-roles` either. Without this the
+        // fail-closed property only holds for Apps that happen to have no workload roles.
+        let state = state(
+            vec![human_policy(PILOT_REPO, &[("contents", "read")])],
+            github_app(vec!["some-workload-role".to_string()]),
+        );
+        let token = approved_token("alex.mason@example.invalid", "req-1");
+
+        let error = authorize(&state, OTHER_REPO, &token).await.unwrap_err();
+
+        assert!(
+            matches!(&error, AppError::Unauthorized(message)
+                if message.contains("no human-policy authorizes")),
+            "expected a fail-closed denial, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_repository_is_denied_when_no_human_policy_exists_at_all() {
+        let state = state(
+            Vec::new(),
+            github_app(vec!["some-workload-role".to_string()]),
+        );
+        let token = approved_token("alex.mason@example.invalid", "req-1");
+
+        assert!(authorize(&state, PILOT_REPO, &token).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_workload_token_cannot_satisfy_a_human_policy() {
+        let state = default_state();
+        // A GitHub Actions style HS256 token, of the shape the workload path accepts.
+        let workload_token = jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &json!({
+                "sub": "repo:myorg/pilot:ref:refs/heads/main",
+                "aud": "idcat",
+                "iss": "https://token.actions.githubusercontent.com",
+                "exp": 4_102_444_800u64,
+                "roles": [TELEPORT_ROLE],
+            }),
+            &jsonwebtoken::EncodingKey::from_secret(b"secret"),
+        )
+        .unwrap();
+
+        assert!(
+            authorize(&state, PILOT_REPO, &workload_token)
+                .await
+                .is_err(),
+            "a workload token must not reach the human path even when it spells the right role"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_human_token_cannot_satisfy_a_workload_policy() {
+        let mut state = default_state();
+        state.token_validator = TokenValidator::new(
+            vec![authzoo::RoleConfig {
+                name: "github-workflow".to_string(),
+                audience: "idcat".to_string(),
+                issuer: "https://token.actions.githubusercontent.com".to_string(),
+                validation_key: Some("secret".to_string()),
+                algorithms: vec![authzoo::JwtAlgorithm::Hs256],
+                claims: BTreeMap::new(),
+            }],
+            false,
+        )
+        .unwrap();
+        let app = GithubAppConfig {
+            allowed_roles: vec!["github-workflow".to_string()],
+            ..github_app(Vec::new())
+        };
+        let token = approved_token("alex.mason@example.invalid", "req-1");
+
+        assert!(
+            state
+                .authorize_github_app(&app, PILOT_REPO, Some(&token))
+                .is_err(),
+            "a Teleport human token must not satisfy a workload allowed-role"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_people_are_given_distinct_cache_partitions() {
+        let state = default_state();
+        let first = approved_token("first@example.invalid", "req-1");
+        let second = approved_token("second@example.invalid", "req-2");
+
+        let (_, first_identity) = authorize(&state, PILOT_REPO, &first).await.unwrap();
+        let (_, second_identity) = authorize(&state, PILOT_REPO, &second).await.unwrap();
+
+        assert_ne!(
+            Requester::person(&first_identity),
+            Requester::person(&second_identity),
+            "two people must never share an installation-token cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_approval_for_the_same_person_is_a_new_cache_partition() {
+        let state = default_state();
+        let first = approved_token("alex.mason@example.invalid", "req-1");
+        let second = approved_token("alex.mason@example.invalid", "req-2");
+
+        let (_, first_identity) = authorize(&state, PILOT_REPO, &first).await.unwrap();
+        let (_, second_identity) = authorize(&state, PILOT_REPO, &second).await.unwrap();
+
+        assert_ne!(
+            Requester::person(&first_identity),
+            Requester::person(&second_identity),
+            "a fresh approval must not revive the token issued under the previous one"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_person_is_never_served_the_shared_workload_partition() {
+        let state = default_state();
+        let token = approved_token("alex.mason@example.invalid", "req-1");
+
+        let (_, identity) = authorize(&state, PILOT_REPO, &token).await.unwrap();
+
+        assert_ne!(Requester::person(&identity), Requester::Workload);
     }
 }

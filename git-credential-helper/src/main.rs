@@ -3,9 +3,9 @@ mod credential;
 mod idcat;
 mod token_source;
 
-use crate::config::Config;
+use crate::config::{Config, Repository};
 use crate::credential::{
-    is_github_https_request, read_credential_from_stdin, repo_from_credential,
+    Repo, is_github_https_request, read_credential_from_stdin, repo_from_credential,
 };
 use crate::idcat::fetch_installation_token;
 use crate::token_source::read_token;
@@ -54,6 +54,17 @@ fn run() -> anyhow::Result<()> {
         }
     };
 
+    if !answers_for(config.repository.as_ref(), &repo) {
+        // Print nothing. Git treats an empty response as "this helper has no credential", moves on
+        // to whatever else is configured, and never sees a value for this repository.
+        info!(
+            requested_owner = %repo.owner,
+            requested_repo = %repo.name,
+            "exiting without output because this helper is configured for a different repository"
+        );
+        return Ok(());
+    }
+
     info!("obtaining bearer token");
     let oidc_token = read_token(&config.token_source)?;
     info!("bearer token obtained");
@@ -64,6 +75,22 @@ fn run() -> anyhow::Result<()> {
     println!();
 
     Ok(())
+}
+
+/// Whether this helper should produce a credential for `requested`.
+///
+/// A configured repository is a hard boundary: the helper prints nothing for anything else, so
+/// Git receives no credential from it and falls through to whatever else is configured. GitHub
+/// owner and repository names are case-insensitive, so the comparison is too — otherwise a clone
+/// URL differing only in case would silently get no credential.
+fn answers_for(configured: Option<&Repository>, requested: &Repo) -> bool {
+    match configured {
+        None => true,
+        Some(configured) => {
+            configured.owner.eq_ignore_ascii_case(&requested.owner)
+                && configured.name.eq_ignore_ascii_case(&requested.name)
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -93,4 +120,68 @@ fn init_logging() {
                 .with_writer(std::io::stderr),
         )
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repo(owner: &str, name: &str) -> Repo {
+        Repo {
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
+    fn configured(owner: &str, name: &str) -> Repository {
+        Repository {
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+        }
+    }
+
+    #[test]
+    fn answers_for_the_configured_repository() {
+        assert!(answers_for(
+            Some(&configured("myorg", "pilot")),
+            &repo("myorg", "pilot")
+        ));
+    }
+
+    #[test]
+    fn does_not_answer_for_another_repository_in_the_same_org() {
+        assert!(!answers_for(
+            Some(&configured("myorg", "pilot")),
+            &repo("myorg", "other")
+        ));
+    }
+
+    #[test]
+    fn does_not_answer_for_the_same_repository_name_under_another_owner() {
+        assert!(!answers_for(
+            Some(&configured("myorg", "pilot")),
+            &repo("otherorg", "pilot")
+        ));
+    }
+
+    #[test]
+    fn does_not_answer_for_a_repository_whose_name_merely_starts_the_same() {
+        assert!(!answers_for(
+            Some(&configured("myorg", "pilot")),
+            &repo("myorg", "pilot-internal")
+        ));
+    }
+
+    #[test]
+    fn matches_case_insensitively_as_github_does() {
+        assert!(answers_for(
+            Some(&configured("MyOrg", "Pilot")),
+            &repo("myorg", "pilot")
+        ));
+    }
+
+    #[test]
+    fn answers_for_anything_when_no_repository_is_configured() {
+        assert!(answers_for(None, &repo("myorg", "anything")));
+    }
 }
