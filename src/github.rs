@@ -21,6 +21,11 @@ const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_API_URL: &str = "https://api.github.com";
 const INSTALLATION_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
 
+/// Opts installation access token requests into GitHub's new stateless (JWT-format) token, per
+/// https://github.blog/changelog/2026-05-15-github-app-installation-tokens-per-request-override-header/
+const GITHUB_STATELESS_S2S_TOKEN_HEADER: &str = "X-GitHub-Stateless-S2S-Token";
+const GITHUB_STATELESS_S2S_TOKEN_ENABLED: &str = "enabled";
+
 #[derive(Clone)]
 pub struct GithubClient {
     client: Client,
@@ -209,6 +214,10 @@ impl GithubClient {
                 self.api_url, installation_id
             ))
             .header(AUTHORIZATION, format!("Bearer {jwt}"))
+            .header(
+                GITHUB_STATELESS_S2S_TOKEN_HEADER,
+                GITHUB_STATELESS_S2S_TOKEN_ENABLED,
+            )
             .json(&request)
             .send()
             .await
