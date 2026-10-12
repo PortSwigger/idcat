@@ -654,6 +654,41 @@ environment = "production"
     }
 
     #[test]
+    fn accepts_an_installation_policy_requiring_membership_of_an_array_claim() {
+        let config: Config = toml::from_str(
+            r#"
+[[role]]
+name = "teleport"
+audience = "https://idcat.teleport.example"
+issuer = "teleport.example"
+validation-key = "shared-secret"
+algorithms = ["HS256"]
+
+[[github-app]]
+name = "source-reader"
+app-id = 42
+secret-key = "private-key.pem"
+
+[[installation-policy]]
+github-app = "source-reader"
+repository = "myorg/alfa"
+role = "teleport"
+required-claims = { roles = { contains = "alfa-readers" } }
+
+[installation-policy.permissions]
+contents = "read"
+"#,
+        )
+        .unwrap();
+
+        config.validate(false).unwrap();
+        assert_eq!(
+            config.installation_policies[0].required_claims["roles"],
+            authzoo::ClaimRequirement::contains("alfa-readers")
+        );
+    }
+
+    #[test]
     fn accepts_wildcard_repository_with_allow_self_access() {
         let config: Config = toml::from_str(
             r#"
