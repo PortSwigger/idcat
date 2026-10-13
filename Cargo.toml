@@ -16,7 +16,7 @@ kms = ["dep:aws-sdk-kms", "dep:aws-config"]
 
 [dependencies]
 anyhow = "1.0"
-authzoo = "0.1.4"
+authzoo = "0.1.6"
 async-nats = "0.50"
 # This feature configureation works around an upstream issue where old creates with vulnerabilites were brought in
 # https://github.com/smithy-lang/smithy-rs/issues/4651

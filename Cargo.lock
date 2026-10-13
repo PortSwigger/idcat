@@ -120,9 +120,9 @@ checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
 name = "authzoo"
-version = "0.1.5"
+version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9667d21a3f73ed6e181e85d310b391e7ef81a3957c78253c39a67488f8605bb5"
+checksum = "21d60099c7c0e46a47c4e570fc28a046f132f04e2c564dc2dd2e35a72bb0334d"
 dependencies = [
  "anyhow",
  "jsonwebtoken",
