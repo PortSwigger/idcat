@@ -495,6 +495,116 @@ mod tests {
             .unwrap();
     }
 
+    /// A role for an issuer that carries membership in an array claim, as Teleport's application
+    /// tokens carry `roles`.
+    fn array_roles_role() -> authzoo::RoleConfig {
+        authzoo::RoleConfig {
+            name: "teleport".to_string(),
+            audience: "https://idcat.teleport.example".to_string(),
+            issuer: "teleport.example".to_string(),
+            validation_key: Some("secret".to_string()),
+            algorithms: vec![authzoo::JwtAlgorithm::Hs256],
+            claims: BTreeMap::new(),
+        }
+    }
+
+    fn array_roles_token(roles: serde_json::Value) -> String {
+        encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({
+                "sub": "someone@example.com",
+                "aud": "https://idcat.teleport.example",
+                "iss": "teleport.example",
+                "exp": 4_102_444_800u64,
+                "roles": roles,
+            }),
+            &EncodingKey::from_secret(b"secret"),
+        )
+        .unwrap()
+    }
+
+    fn array_roles_state() -> AppState {
+        let mut state = test_state_with_installation_policies(
+            vec![GithubAppConfig {
+                name: "default".to_string(),
+                app_id: 42,
+                secret_key: "private-key.pem".to_string(),
+                webhook_target: None,
+                webhook_validation_secret_file: None,
+                allowed_roles: Vec::new(),
+            }],
+            vec![InstallationPolicyConfig {
+                github_app: "default".to_string(),
+                repositories: vec!["myorg/alfa".to_string()],
+                role: "teleport".to_string(),
+                required_claims: BTreeMap::from([(
+                    "roles".to_string(),
+                    authzoo::ClaimRequirement::contains("alfa-readers"),
+                )]),
+                allow_self_access: false,
+                permissions: BTreeMap::from([("contents".to_string(), "read".to_string())]),
+            }],
+        );
+        state.token_validator = TokenValidator::new(vec![array_roles_role()], false).unwrap();
+        state
+    }
+
+    #[test]
+    fn authorize_github_app_matches_a_role_held_in_an_array_claim() {
+        let state = array_roles_state();
+        let github_app = state.github_app("default").unwrap().clone();
+        let token = array_roles_token(serde_json::json!(["some-other-role", "alfa-readers"]));
+
+        let scope = state
+            .authorize_github_app(&github_app, "myorg/alfa", Some(&token))
+            .unwrap();
+
+        assert_eq!(scope.repositories, RepoScope::OnlyRequested);
+        assert_eq!(
+            scope.permissions,
+            BTreeMap::from([("contents".to_string(), "read".to_string())])
+        );
+    }
+
+    #[test]
+    fn authorize_github_app_rejects_an_array_claim_without_the_role() {
+        let state = array_roles_state();
+        let github_app = state.github_app("default").unwrap().clone();
+        let token = array_roles_token(serde_json::json!(["alfa-readers-pending"]));
+
+        assert!(
+            state
+                .authorize_github_app(&github_app, "myorg/alfa", Some(&token))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn authorize_github_app_rejects_a_string_claim_spelling_the_role() {
+        let state = array_roles_state();
+        let github_app = state.github_app("default").unwrap().clone();
+        let token = array_roles_token(serde_json::json!("alfa-readers"));
+
+        assert!(
+            state
+                .authorize_github_app(&github_app, "myorg/alfa", Some(&token))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn authorize_github_app_does_not_extend_an_array_role_match_to_another_repository() {
+        let state = array_roles_state();
+        let github_app = state.github_app("default").unwrap().clone();
+        let token = array_roles_token(serde_json::json!(["alfa-readers"]));
+
+        assert!(
+            state
+                .authorize_github_app(&github_app, "myorg/beta", Some(&token))
+                .is_err()
+        );
+    }
+
     #[test]
     fn authorize_github_app_rejects_installation_policy_when_required_claims_do_not_match() {
         let mut required_claims = BTreeMap::new();
