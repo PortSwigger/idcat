@@ -17,7 +17,7 @@ kms = ["dep:aws-sdk-kms", "dep:aws-config"]
 [dependencies]
 anyhow = "1.0"
 authzoo = "0.1.6"
-async-nats = "0.50"
+async-nats = "0.51"
 # This feature configureation works around an upstream issue where old creates with vulnerabilites were brought in
 # https://github.com/smithy-lang/smithy-rs/issues/4651
 aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "default-https-client"], optional = true }
