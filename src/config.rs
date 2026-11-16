@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, de};
 use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::LazyLock;
+use std::time::Duration;
 use tracing::warn;
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +101,10 @@ pub struct InstallationPolicyConfig {
     pub required_claims: BTreeMap<String, authzoo::ClaimRequirement>,
     pub allow_self_access: bool,
     pub permissions: BTreeMap<String, String>,
+    /// How long idcat may reuse a token minted for this policy, from `max-token-age-minutes`.
+    /// GitHub's tokens last an hour and idcat otherwise reuses one for up to 50 minutes, so a
+    /// caller that stores its token can cap the reuse to always get one with time to spare.
+    pub max_token_age: Option<Duration>,
 }
 
 #[derive(Deserialize)]
@@ -115,6 +120,7 @@ struct RawInstallationPolicyConfig {
     allow_self_access: bool,
     // Keys are GitHub permission names (snake_case), not kebab-case.
     permissions: BTreeMap<String, String>,
+    max_token_age_minutes: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for InstallationPolicyConfig {
@@ -145,6 +151,7 @@ impl<'de> Deserialize<'de> for InstallationPolicyConfig {
             required_claims: raw.required_claims,
             allow_self_access: raw.allow_self_access,
             permissions: raw.permissions,
+            max_token_age: raw.max_token_age_minutes.map(duration_from_minutes),
         })
     }
 }
@@ -167,6 +174,8 @@ pub struct OwnerPolicyConfig {
     pub required_claims: BTreeMap<String, authzoo::ClaimRequirement>,
     pub allow_self_access: bool,
     pub permissions: BTreeMap<String, String>,
+    /// See [`InstallationPolicyConfig::max_token_age`].
+    pub max_token_age: Option<Duration>,
 }
 
 #[derive(Deserialize)]
@@ -183,6 +192,7 @@ struct RawOwnerPolicyConfig {
     // Keys are GitHub permission names (snake_case), not kebab-case.
     #[serde(default)]
     permissions: BTreeMap<String, String>,
+    max_token_age_minutes: Option<u64>,
 }
 
 impl<'de> Deserialize<'de> for OwnerPolicyConfig {
@@ -213,6 +223,7 @@ impl<'de> Deserialize<'de> for OwnerPolicyConfig {
             required_claims: raw.required_claims,
             allow_self_access: raw.allow_self_access,
             permissions: raw.permissions,
+            max_token_age: raw.max_token_age_minutes.map(duration_from_minutes),
         })
     }
 }
@@ -428,6 +439,14 @@ impl Config {
                         installation_policy.role
                     );
                 }
+                if !is_valid_max_token_age(installation_policy.max_token_age) {
+                    anyhow::bail!(
+                        "installation-policy for github-app '{}' repository '{}' role '{}' max-token-age-minutes must be between 1 and {MAX_TOKEN_AGE_MINUTES}",
+                        installation_policy.github_app,
+                        installation_policy.repositories_label(),
+                        installation_policy.role
+                    );
+                }
                 for (name, value) in &installation_policy.permissions {
                     if !known_github_permissions().contains(name.as_str()) {
                         warn!(
@@ -488,6 +507,14 @@ impl Config {
                 if owner_policy.permissions.is_empty() {
                     anyhow::bail!(
                         "owner-policy for github-app '{}' owner '{}' role '{}' must define at least one permission under [owner-policy.permissions]; an owner-wide token without narrowed permissions is what allowed-roles already grants",
+                        owner_policy.github_app,
+                        owner_policy.owners_label(),
+                        owner_policy.role
+                    );
+                }
+                if !is_valid_max_token_age(owner_policy.max_token_age) {
+                    anyhow::bail!(
+                        "owner-policy for github-app '{}' owner '{}' role '{}' max-token-age-minutes must be between 1 and {MAX_TOKEN_AGE_MINUTES}",
                         owner_policy.github_app,
                         owner_policy.owners_label(),
                         owner_policy.role
@@ -590,6 +617,21 @@ impl Config {
     }
 }
 
+/// The largest `max-token-age-minutes`: idcat never reuses a token for longer than this anyway.
+const MAX_TOKEN_AGE_MINUTES: u64 = crate::github::INSTALLATION_TOKEN_CACHE_TTL.as_secs() / 60;
+
+fn duration_from_minutes(minutes: u64) -> Duration {
+    // Saturates rather than overflowing, so an absurd value fails validation instead of wrapping.
+    Duration::from_secs(minutes.saturating_mul(60))
+}
+
+/// Whether a policy's max token age, if it sets one, is at least a minute and no longer than idcat
+/// reuses a token for anyway.
+fn is_valid_max_token_age(max_token_age: Option<Duration>) -> bool {
+    let allowed = Duration::from_secs(60)..=crate::github::INSTALLATION_TOKEN_CACHE_TTL;
+    max_token_age.is_none_or(|age| allowed.contains(&age))
+}
+
 fn is_valid_owner_pattern(pattern: &str) -> bool {
     !pattern.is_empty() && !pattern.contains('/')
 }
@@ -621,6 +663,7 @@ fn default_private_key_directory() -> String {
 #[cfg(test)]
 mod tests {
     use super::{Config, KeySource, WebhookTarget};
+    use std::time::Duration;
 
     #[test]
     fn accepts_wildcard_repository_without_allow_self_access() {
@@ -1790,5 +1833,76 @@ secret-key = "private-key.pem"
         .unwrap();
 
         config.validate(true).unwrap();
+    }
+
+    #[test]
+    fn parses_owner_policy_max_token_age_minutes() {
+        let config: Config = toml::from_str(&owner_policy_config(
+            r#"
+[[owner-policy]]
+github-app = "deployments"
+owner = "myorg"
+role = "github-workflow"
+allow-self-access = true
+max-token-age-minutes = 15
+
+[owner-policy.permissions]
+contents = "read"
+"#,
+        ))
+        .unwrap();
+
+        config.validate(false).unwrap();
+        let fifteen_minutes = Duration::from_secs(15 * 60);
+        let owner_policy = &config.owner_policies[0];
+        assert_eq!(owner_policy.max_token_age, Some(fifteen_minutes));
+    }
+
+    #[test]
+    fn rejects_owner_policy_max_token_age_of_zero() {
+        let config: Config = toml::from_str(&owner_policy_config(
+            r#"
+[[owner-policy]]
+github-app = "deployments"
+owner = "myorg"
+role = "github-workflow"
+allow-self-access = true
+max-token-age-minutes = 0
+
+[owner-policy.permissions]
+contents = "read"
+"#,
+        ))
+        .unwrap();
+
+        let error = config.validate(false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "owner-policy for github-app 'deployments' owner 'myorg' role 'github-workflow' max-token-age-minutes must be between 1 and 50"
+        );
+    }
+
+    #[test]
+    fn rejects_owner_policy_max_token_age_longer_than_idcat_reuses_a_token() {
+        let config: Config = toml::from_str(&owner_policy_config(
+            r#"
+[[owner-policy]]
+github-app = "deployments"
+owner = "myorg"
+role = "github-workflow"
+allow-self-access = true
+max-token-age-minutes = 51
+
+[owner-policy.permissions]
+contents = "read"
+"#,
+        ))
+        .unwrap();
+
+        let error = config.validate(false).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "owner-policy for github-app 'deployments' owner 'myorg' role 'github-workflow' max-token-age-minutes must be between 1 and 50"
+        );
     }
 }

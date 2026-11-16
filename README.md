@@ -85,6 +85,12 @@ packages = "read"
 An `[[installation-policy]]` never widens beyond the requested repository, and an
 `[[owner-policy]]` grants nothing on the repository endpoint; the two are independent.
 
+Either kind of policy can set `max-token-age-minutes`, from 1 to 50. GitHub's tokens last an hour
+and idcat reuses one for up to 50 minutes, so a caller can be handed a token with only 10 minutes
+left. That suits a token used straight away, not one a caller stores: with
+`max-token-age-minutes = 15`, every token idcat hands out for that policy has at least 45 minutes
+left. A policy that sets it gets its own cached token, so other callers are unaffected.
+
 Mount the private keys as files. For example, in Kubernetes this could be a Secret volume mounted at `private-key-directory`, but `idcat` only reads files from the filesystem.
 
 ```sh

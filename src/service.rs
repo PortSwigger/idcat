@@ -12,6 +12,7 @@ use crate::secret::FilePrivateKeyStore;
 use crate::signer::{LocalSigner, Signer};
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::debug;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd)]
@@ -24,6 +25,9 @@ pub enum RepoScope {
 pub struct TokenScope {
     pub repositories: RepoScope,
     pub permissions: BTreeMap<String, String>,
+    /// The policy's `max-token-age-minutes`, if it sets one. Part of the token cache key, so a
+    /// capped caller is never served a token cached for an uncapped one.
+    pub max_token_age: Option<Duration>,
 }
 
 impl TokenScope {
@@ -31,6 +35,7 @@ impl TokenScope {
         Self {
             repositories: RepoScope::All,
             permissions: BTreeMap::new(),
+            max_token_age: None,
         }
     }
 }
@@ -140,6 +145,7 @@ impl AppState {
             return Ok(TokenScope {
                 repositories: RepoScope::OnlyRequested,
                 permissions: installation_policy.permissions.clone(),
+                max_token_age: installation_policy.max_token_age,
             });
         }
         Err(AppError::Unauthorized(format!(
@@ -201,6 +207,7 @@ impl AppState {
             return Ok(TokenScope {
                 repositories: RepoScope::All,
                 permissions: owner_policy.permissions.clone(),
+                max_token_age: owner_policy.max_token_age,
             });
         }
         Err(AppError::Unauthorized(format!(
@@ -326,6 +333,7 @@ mod tests {
     use serde::Serialize;
     use std::collections::BTreeMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     fn test_state(github_apps: Vec<GithubAppConfig>) -> AppState {
         test_state_with_policies(github_apps, Vec::new(), Vec::new())
@@ -484,6 +492,7 @@ mod tests {
                 required_claims,
                 allow_self_access: false,
                 permissions: BTreeMap::new(),
+                max_token_age: None,
             }],
         );
         state.token_validator = TokenValidator::new(vec![github_workflow_role()], false).unwrap();
@@ -543,6 +552,7 @@ mod tests {
                 )]),
                 allow_self_access: false,
                 permissions: BTreeMap::from([("contents".to_string(), "read".to_string())]),
+                max_token_age: None,
             }],
         );
         state.token_validator = TokenValidator::new(vec![array_roles_role()], false).unwrap();
@@ -628,6 +638,7 @@ mod tests {
                 required_claims,
                 allow_self_access: false,
                 permissions: BTreeMap::new(),
+                max_token_age: None,
             }],
         );
         state.token_validator = TokenValidator::new(vec![github_workflow_role()], false).unwrap();
@@ -762,6 +773,7 @@ mod tests {
             permissions: [("packages".to_string(), "read".to_string())]
                 .into_iter()
                 .collect(),
+            max_token_age: None,
         }
     }
 
@@ -787,6 +799,22 @@ mod tests {
             scope.permissions.get("packages").map(String::as_str),
             Some("read")
         );
+    }
+
+    #[test]
+    fn authorize_owner_carries_the_policy_max_token_age() {
+        let fifteen_minutes = Duration::from_secs(15 * 60);
+        let mut owner_policy = packages_owner_policy();
+        owner_policy.max_token_age = Some(fifteen_minutes);
+        let state = state_with_owner_policy(owner_policy);
+
+        let token = github_workflow_token("myorg/alfa");
+        let github_app = state.github_app("default").unwrap().clone();
+        let scope = state
+            .authorize_owner(&github_app, "myorg", Some(&token))
+            .unwrap();
+
+        assert_eq!(scope.max_token_age, Some(fifteen_minutes));
     }
 
     #[test]
@@ -858,6 +886,7 @@ mod tests {
             required_claims: BTreeMap::new(),
             allow_self_access: true,
             permissions: BTreeMap::new(),
+            max_token_age: None,
         }
     }
 
