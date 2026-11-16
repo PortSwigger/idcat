@@ -19,7 +19,7 @@ use tracing::debug;
 const GITHUB_API_VERSION_HEADER: &str = "X-GitHub-Api-Version";
 const GITHUB_API_VERSION: &str = "2022-11-28";
 const GITHUB_API_URL: &str = "https://api.github.com";
-const INSTALLATION_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
+pub(crate) const INSTALLATION_TOKEN_CACHE_TTL: Duration = Duration::from_secs(50 * 60);
 
 /// Opts installation access token requests into GitHub's new stateless (JWT-format) token, per
 /// https://github.blog/changelog/2026-05-15-github-app-installation-tokens-per-request-override-header/
@@ -438,7 +438,13 @@ impl GithubClient {
         key: InstallationTokenCacheKey,
         token: InstallationTokenResponse,
     ) {
-        let refresh_after = Instant::now() + INSTALLATION_TOKEN_CACHE_TTL;
+        // GitHub's tokens last an hour, so the longer one is reused, the less of it a caller gets.
+        // A policy's max-token-age caps the reuse for its own cache entry.
+        let mut ttl = INSTALLATION_TOKEN_CACHE_TTL;
+        if let Some(max_token_age) = key.scope.max_token_age {
+            ttl = ttl.min(max_token_age);
+        }
+        let refresh_after = Instant::now() + ttl;
         self.cache.lock().await.installation_tokens.insert(
             key,
             CachedInstallationToken {
@@ -500,6 +506,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     struct StubSigner;
 
@@ -624,6 +631,7 @@ mod tests {
         TokenScope {
             repositories: RepoScope::All,
             permissions: BTreeMap::new(),
+            max_token_age: None,
         }
     }
 
@@ -634,6 +642,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            max_token_age: None,
         }
     }
 
@@ -742,6 +751,7 @@ mod tests {
                     permissions: [("packages".to_string(), "read".to_string())]
                         .into_iter()
                         .collect(),
+                    max_token_age: None,
                 },
             )
             .await
@@ -854,6 +864,102 @@ mod tests {
         assert!(
             error.to_string().contains("no repository was requested"),
             "unexpected error: {error}"
+        );
+    }
+
+    fn scope_with_max_token_age(max_token_age: Duration) -> TokenScope {
+        TokenScope {
+            max_token_age: Some(max_token_age),
+            ..broad_scope()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_token_within_the_max_token_age_is_reused() {
+        let stub = spawn_stub_github_api(&["myorg"]).await;
+        let mut client = GithubClient::new().unwrap();
+        client.api_url = stub.url;
+        let github_app = test_github_app();
+        let target = owner_target();
+        let scope = scope_with_max_token_age(Duration::from_secs(15 * 60));
+
+        let first = client
+            .create_installation_token(&github_app, &StubSigner, &target, scope.clone())
+            .await
+            .unwrap();
+        let second = client
+            .create_installation_token(&github_app, &StubSigner, &target, scope)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            first.token, second.token,
+            "a token younger than the max token age must be reused"
+        );
+        assert_eq!(
+            stub.mint_count.load(Ordering::SeqCst),
+            1,
+            "a token younger than the max token age must not be minted again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_token_older_than_the_max_token_age_is_minted_again() {
+        let stub = spawn_stub_github_api(&["myorg"]).await;
+        let mut client = GithubClient::new().unwrap();
+        client.api_url = stub.url;
+        let github_app = test_github_app();
+        let target = owner_target();
+        // A zero max token age makes every cached token too old, without the test having to wait.
+        let scope = scope_with_max_token_age(Duration::ZERO);
+
+        let first = client
+            .create_installation_token(&github_app, &StubSigner, &target, scope.clone())
+            .await
+            .unwrap();
+        let second = client
+            .create_installation_token(&github_app, &StubSigner, &target, scope)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            first.token, second.token,
+            "a token older than the max token age must not be reused"
+        );
+        assert_eq!(
+            stub.mint_count.load(Ordering::SeqCst),
+            2,
+            "a token older than the max token age must be minted again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_capped_caller_is_not_served_a_token_cached_for_an_uncapped_one() {
+        let stub = spawn_stub_github_api(&["myorg"]).await;
+        let mut client = GithubClient::new().unwrap();
+        client.api_url = stub.url;
+        let github_app = test_github_app();
+        let target = owner_target();
+        let capped_scope = scope_with_max_token_age(Duration::from_secs(15 * 60));
+
+        // An uncapped caller mints and caches a token, which it may reuse for 50 minutes.
+        let uncapped = client
+            .create_installation_token(&github_app, &StubSigner, &target, broad_scope())
+            .await
+            .unwrap();
+        let capped = client
+            .create_installation_token(&github_app, &StubSigner, &target, capped_scope)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            uncapped.token, capped.token,
+            "a capped caller received a token cached for an uncapped one"
+        );
+        assert_eq!(
+            stub.mint_count.load(Ordering::SeqCst),
+            2,
+            "a capped caller must mint its own token rather than share a cache entry"
         );
     }
 }
