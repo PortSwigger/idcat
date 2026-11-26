@@ -34,12 +34,12 @@ jobs:
           enable-cache: true
 
       - name: Install python
-        run: uv venv && uv pip install bktools --extra-index-url https://repo.noa.re
+        run: uv venv
 
       - name: Compute Docker image tag
         id: image-version
         run: |
-          image_version="$(uv run bktools-image-version-hash)"
+          image_version="$(uvx --from "git+https://github.com/portswigger-cloud/container-image-hash@07d00c5c6556677e488a72eecb42600e156b974a" container-image-hash)"
           echo "tag=${image_version}" >> "$GITHUB_OUTPUT"
 
   build:
