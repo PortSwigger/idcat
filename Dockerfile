@@ -3,7 +3,7 @@
 
 # Adapted from https://github.com/LukeMathWalker/cargo-chef
 FROM rust:slim-trixie AS planner
-COPY --from=nresare/cargo-chef:binonly /cargo-chef /bin/cargo-chef
+COPY --from=nresare/cargo-chef:binonly@sha256:9e7ccde3a3179e895c628383980c1b98928adc0a074e280c84bfb46e1ad3633a /cargo-chef /bin/cargo-chef
 WORKDIR /build
 
 COPY . .
